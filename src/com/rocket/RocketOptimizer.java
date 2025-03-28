@@ -25,12 +25,12 @@ import java.util.Map;
 import java.util.function.Function;
 
 public class RocketOptimizer {
-
     private final List<FinParameter> parameters = new ArrayList<>();
     private final OptimizationConfig config = new OptimizationConfig();
     private final Map<String, Double> bestValues = new HashMap<>();
     private EllipticalFinSet fins;
     private BodyTube bodyTube;
+    private NoseCone noseCone;
     private OpenRocketDocument document;
     private Rocket rocket;
     private SimulationOptions baseOptions;
@@ -43,12 +43,55 @@ public class RocketOptimizer {
     private int evaluationsInPhase = 0;
     private int totalEvaluationsInPhase = 0;
     private final double errorThreshold = 1.0;
+    private Map<String, Double> originalValues = new HashMap<>();
 
     public RocketOptimizer() {
         parameters.add(new FinParameter("thickness", 0.1, 1.2, 0.5, v -> v / 100));
         parameters.add(new FinParameter("rootChord", 1, 8, 2, v -> v / 100));
         parameters.add(new FinParameter("height", 1, 9, 2, v -> v / 100));
         parameters.add(new FinParameter("finCount", 2, 4, 2, v -> v));
+        parameters.add(new FinParameter("noseLength", 0.2, 18, 2, v -> v / 100));
+    }
+
+    public static class OptimizationConfig {
+        public String orkPath = "rocket.ork";
+        public double targetApogee = 241.0;
+        public double[] stabilityRange = {1.0, 2.0};
+        public double[] durationRange = {41.0, 44.0};
+        public Map<String, Boolean> enabledParams = new HashMap<>();
+    }
+
+    private static class FinParameter {
+        final String name;
+        final double absoluteMin;
+        final double absoluteMax;
+        final Function<Double, Double> converter;
+        double currentMin;
+        double currentMax;
+        double step;
+        double currentValue;
+
+        FinParameter(String name, double absoluteMin, double absoluteMax, double initialStep, Function<Double, Double> converter) {
+            this.name = name;
+            this.absoluteMin = absoluteMin;
+            this.absoluteMax = absoluteMax;
+            this.currentMin = absoluteMin;
+            this.currentMax = absoluteMax;
+            this.step = initialStep;
+            this.converter = converter;
+        }
+    }
+
+    public interface LogListener {
+        void log(String message);
+    }
+
+    public interface StatusListener {
+        void updateStatus(String status);
+    }
+
+    public interface ProgressListener {
+        void updateProgress(int currentPhase, int currentEval, int totalEval, int totalPhases);
     }
 
     public OptimizationConfig getConfig() {
@@ -57,6 +100,10 @@ public class RocketOptimizer {
 
     public boolean hasBestValues() {
         return !bestValues.isEmpty();
+    }
+
+    public Map<String, Double> getBestValues() {
+        return new HashMap<>(bestValues);
     }
 
     public void initialize() throws Exception {
@@ -70,7 +117,17 @@ public class RocketOptimizer {
             throw new RuntimeException("No elliptical fin set found");
         }
         bodyTube = (BodyTube) fins.getParent();
+        noseCone = findNoseCone(rocket);
+        if (noseCone == null) {
+            throw new RuntimeException("No nose cone found");
+        }
         baseOptions = document.getSimulations().get(0).getOptions();
+
+        originalValues.put("thickness", fins.getThickness());
+        originalValues.put("rootChord", fins.getLength());
+        originalValues.put("height", fins.getHeight());
+        originalValues.put("finCount", (double) fins.getFinCount());
+        originalValues.put("noseLength", noseCone.getLength());
     }
 
     public void setLogListener(LogListener listener) {
@@ -107,9 +164,25 @@ public class RocketOptimizer {
         }
 
         FinParameter param = parameters.get(paramIndex);
+        if (!config.enabledParams.getOrDefault(getDisplayName(param.name), true)) {
+            optimizeRecursive(paramIndex + 1);
+            return;
+        }
+
         for (double value = param.currentMin; value <= param.currentMax; value += param.step) {
             param.currentValue = value;
             optimizeRecursive(paramIndex + 1);
+        }
+    }
+
+    private String getDisplayName(String paramName) {
+        switch (paramName) {
+            case "thickness": return "Fin Thickness";
+            case "rootChord": return "Root Chord";
+            case "height": return "Fin Height";
+            case "finCount": return "Number of Fins";
+            case "noseLength": return "Nose Cone Length";
+            default: return paramName;
         }
     }
 
@@ -127,41 +200,69 @@ public class RocketOptimizer {
         }
 
         try {
-            // Apply current parameters to fins
-            fins.setThickness(getConvertedValue("thickness"));
-            fins.setLength(getConvertedValue("rootChord"));
-            fins.setHeight(getConvertedValue("height"));
-            fins.setFinCount((int) Math.round(getRawValue("finCount")));
+            if (config.enabledParams.getOrDefault("Fin Thickness", true)) {
+                fins.setThickness(getConvertedValue("thickness"));
+            } else {
+                fins.setThickness(originalValues.get("thickness"));
+            }
 
-            // Force model update with aerodynamic change
+            if (config.enabledParams.getOrDefault("Root Chord", true)) {
+                fins.setLength(getConvertedValue("rootChord"));
+            } else {
+                fins.setLength(originalValues.get("rootChord"));
+            }
+
+            if (config.enabledParams.getOrDefault("Fin Height", true)) {
+                fins.setHeight(getConvertedValue("height"));
+            } else {
+                fins.setHeight(originalValues.get("height"));
+            }
+
+            if (config.enabledParams.getOrDefault("Number of Fins", true)) {
+                fins.setFinCount((int) Math.round(getRawValue("finCount")));
+            } else {
+                fins.setFinCount(originalValues.get("finCount").intValue());
+            }
+
+            if (config.enabledParams.getOrDefault("Nose Cone Length", true)) {
+                noseCone.setLength(getConvertedValue("noseLength"));
+            } else {
+                noseCone.setLength(originalValues.get("noseLength"));
+            }
+
             rocket.enableEvents();
             FlightConfigurationId configId = document.getSelectedConfiguration().getId();
             rocket.fireComponentChangeEvent(ComponentChangeEvent.AERODYNAMIC_CHANGE, configId);
 
-            // Calculate stability
             double stability = calculateStability();
             if (stability < config.stabilityRange[0] || stability > config.stabilityRange[1]) {
-                logCurrent("Skipping", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, null);
+                logCurrent("Skipping", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Stability out of range");
                 return;
             }
 
-            // Run simulation
             SimulationStepper.SimulationResult result = new SimulationStepper(rocket, baseOptions).runSimulation();
             double apogee = result.altitude;
             double duration = result.duration;
 
-            // Calculate scores
-            double altitudeScore = Math.abs(apogee - config.targetApogee);
-            double durationScore = calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]);
+            double altitudeScore = config.enabledParams.getOrDefault("Altitude Score", true) ?
+                    Math.abs(apogee - config.targetApogee) : 0;
+            double durationScore = config.enabledParams.getOrDefault("Duration Score", true) ?
+                    calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]) : 0;
             double totalError = altitudeScore + durationScore;
 
-            // Update best configuration
+            if (logListener != null) {
+                String interimData = String.format("thickness=%.2f|rootChord=%.2f|height=%.2f|finCount=%.0f|noseLength=%.2f|apogee=%.1f|duration=%.2f|altitudeScore=%.1f|durationScore=%.2f|totalScore=%.2f",
+                        getRawValue("thickness"), getRawValue("rootChord"),
+                        getRawValue("height"), getRawValue("finCount"),
+                        getRawValue("noseLength"), apogee, duration,
+                        altitudeScore, durationScore, altitudeScore + durationScore);
+                logListener.log("INTERIM:" + interimData);
+            }
+
             if (totalError < bestError) {
                 bestError = totalError;
                 updateBestValues(apogee, duration, altitudeScore, durationScore);
                 logCurrent("Best", stability, apogee, duration, altitudeScore, durationScore, null);
-
-                // Notify tree change
                 rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE);
             }
         } catch (Exception e) {
@@ -178,7 +279,7 @@ public class RocketOptimizer {
     public void optimizeFins() {
         bestError = Double.MAX_VALUE;
         for (currentPhase = 0; currentPhase < phases; currentPhase++) {
-            if (bestError < errorThreshold) break; // Early termination
+            if (bestError < errorThreshold) break;
             if (currentPhase > 0) adjustParametersForNextPhase();
             totalEvaluationsInPhase = calculateTotalEvaluations();
             evaluationsInPhase = 0;
@@ -205,6 +306,9 @@ public class RocketOptimizer {
     private int calculateTotalEvaluations() {
         int total = 1;
         for (FinParameter param : parameters) {
+            if (!config.enabledParams.getOrDefault(getDisplayName(param.name), true)) {
+                continue;
+            }
             int steps = (int) ((param.currentMax - param.currentMin) / param.step) + 1;
             total *= steps;
         }
@@ -303,8 +407,20 @@ public class RocketOptimizer {
         }
     }
 
+    private NoseCone findNoseCone(RocketComponent component) {
+        if (component instanceof NoseCone) {
+            return (NoseCone) component;
+        }
+        for (RocketComponent child : component.getChildren()) {
+            NoseCone found = findNoseCone(child);
+            if (found != null) {
+                return found;
+            }
+        }
+        return null;
+    }
+
     public void saveOptimizedDesign(File file) throws Exception {
-        // Re-apply best parameters using bestValues
         for (FinParameter param : parameters) {
             String name = param.name;
             double rawValue = bestValues.get(name);
@@ -322,12 +438,14 @@ public class RocketOptimizer {
                 case "finCount":
                     fins.setFinCount((int) Math.round(rawValue));
                     break;
+                case "noseLength":
+                    noseCone.setLength(convertedValue);
+                    break;
                 default:
                     throw new IllegalStateException("Unexpected parameter: " + name);
             }
         }
 
-        // Force document update
         rocket.enableEvents();
         rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE | ComponentChangeEvent.AERODYNAMIC_CHANGE);
         rocket.update();
@@ -336,46 +454,6 @@ public class RocketOptimizer {
             RocketSaver saver = new OpenRocketSaver();
             StorageOptions options = document.getDefaultStorageOptions();
             saver.save(fos, document, options, new WarningSet(), new ErrorSet());
-        }
-    }
-
-    public interface LogListener {
-        void log(String message);
-    }
-
-    public interface StatusListener {
-        void updateStatus(String status);
-    }
-
-    public interface ProgressListener {
-        void updateProgress(int currentPhase, int currentEval, int totalEval, int totalPhases);
-    }
-
-    public static class OptimizationConfig {
-        public String orkPath = "rocket.ork";
-        public double targetApogee = 241.0;
-        public double[] stabilityRange = {1.0, 2.0};
-        public double[] durationRange = {41.0, 44.0};
-    }
-
-    private static class FinParameter {
-        final String name;
-        final double absoluteMin;
-        final double absoluteMax;
-        final Function<Double, Double> converter;
-        double currentMin;
-        double currentMax;
-        double step;
-        double currentValue;
-
-        FinParameter(String name, double absoluteMin, double absoluteMax, double initialStep, Function<Double, Double> converter) {
-            this.name = name;
-            this.absoluteMin = absoluteMin;
-            this.absoluteMax = absoluteMax;
-            this.currentMin = absoluteMin;
-            this.currentMax = absoluteMax;
-            this.step = initialStep;
-            this.converter = converter;
         }
     }
 }
