@@ -18,12 +18,17 @@ import net.sf.openrocket.util.Coordinate;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import java.io.IOException;
+import net.sf.openrocket.simulation.exception.SimulationException;
 
 public class Optimizer {
     private final List<FinParameter> parameters = new ArrayList<>();
@@ -39,8 +44,6 @@ public class Optimizer {
     private LogListener logListener;
     private StatusListener statusListener;
     private ProgressListener progressListener;
-    private final int phases = 5;
-    private final double errorThreshold = 1.0;
     private Map<String, Double> originalValues = new HashMap<>();
     private volatile boolean cancelled = false;
     
@@ -57,6 +60,14 @@ public class Optimizer {
     private String currentStage2Parachute = "None";
     private String bestStage1Parachute = "None";
     private String bestStage2Parachute = "None";
+
+    // Nelder-Mead parameters
+    private static final double NM_ALPHA = 1.0; // Reflection factor
+    private static final double NM_GAMMA = 2.0; // Expansion factor
+    private static final double NM_RHO = 0.5;   // Contraction factor
+    private static final double NM_SIGMA = 0.5; // Shrink factor
+    private static final int NM_MAX_ITERATIONS = 100; // Max iterations per run
+    private static final double NM_TOLERANCE = 1e-4; // Termination tolerance
 
     public Optimizer() {
         // Use derived minimums and Double.MAX_VALUE for maximums where no explicit limit exists
@@ -179,12 +190,13 @@ public class Optimizer {
         }
         // --- End Update dynamic bounds --- 
 
-        originalValues.put("thickness", fins.getThickness());
-        originalValues.put("rootChord", fins.getLength());
-        originalValues.put("height", fins.getHeight());
-        originalValues.put("finCount", (double) fins.getFinCount());
-        originalValues.put("noseLength", noseCone.getLength());
-        originalValues.put("noseWallThickness", noseCone.getThickness());
+        // Store original RAW values (cm / count)
+        originalValues.put("thickness", fins.getThickness() * 100.0); // m to cm
+        originalValues.put("rootChord", fins.getLength() * 100.0); // m to cm
+        originalValues.put("height", fins.getHeight() * 100.0); // m to cm
+        originalValues.put("finCount", (double) fins.getFinCount()); // already count
+        originalValues.put("noseLength", noseCone.getLength() * 100.0); // m to cm
+        originalValues.put("noseWallThickness", noseCone.getThickness() * 100.0); // m to cm
         
         // Find parachutes in the rocket
         stage1Parachute = findFirstParachute(rocket);
@@ -243,115 +255,178 @@ public class Optimizer {
         }
     }
 
-    private void optimizeRecursive(int paramIndex) {
-        if (cancelled) return;
-        
-        if (paramIndex >= parameters.size()) {
-            evaluateConfiguration();
-            return;
+    // Interface for the objective function used by Nelder-Mead
+    public interface ObjectiveFunction {
+        double evaluate(double[] point);
+    }
+
+    // Nested class for Nelder-Mead Optimizer
+    private static class NelderMeadOptimizer {
+        private final ObjectiveFunction function;
+        private final int dimensions;
+        private final double tolerance;
+        private final int maxIterations;
+        private ProgressListener progressListener; // Optional progress listener
+        private int baseProgressStep = 0;
+        private int totalEstimatedProgressSteps = 1; // Avoid division by zero
+
+        public NelderMeadOptimizer(ObjectiveFunction function, int dimensions, double tolerance, int maxIterations) {
+            this.function = function;
+            this.dimensions = dimensions;
+            this.tolerance = tolerance;
+            this.maxIterations = maxIterations;
         }
 
-        FinParameter param = parameters.get(paramIndex);
-        // Use the internal param.name as the key for the enabled check
-        boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
-        
-        if (!isEnabled) {
-            param.currentValue = originalValues.get(param.name);
-            optimizeRecursive(paramIndex + 1);
-            return;
+        public void setProgressListener(ProgressListener listener, int baseStep, int totalSteps) {
+             this.progressListener = listener;
+             this.baseProgressStep = baseStep;
+             this.totalEstimatedProgressSteps = Math.max(1, totalSteps); // Ensure at least 1
         }
 
-        // Handle special cases
-        if (param.currentMin == Double.NEGATIVE_INFINITY && param.currentMax == Double.MAX_VALUE) {
-            // Special case for finCount - use only positive integers
-            if ("finCount".equals(param.name)) {
-                double[] valuesToTry = {1.0, 2.0, 3.0, 4.0, 6.0, 8.0};
-                for (double value : valuesToTry) {
-                    if (cancelled) return;
-                    param.currentValue = value;
-                    optimizeRecursive(paramIndex + 1);
-                }
-                return;
+        public double[] optimize(double[] initialGuess) {
+            // Initialize simplex
+            double[][] simplex = new double[dimensions + 1][dimensions];
+            double[] fSimplex = new double[dimensions + 1];
+
+            // Initial point
+            simplex[0] = Arrays.copyOf(initialGuess, dimensions);
+            fSimplex[0] = function.evaluate(simplex[0]);
+            int evaluations = 1;
+
+            // Create other points by perturbing the initial guess slightly along each axis
+            double perturbation = 0.05; // 5% perturbation
+             for (int i = 0; i < dimensions; i++) {
+                 simplex[i + 1] = Arrays.copyOf(initialGuess, dimensions);
+                 // Perturb only if the initial guess for this dimension is not zero,
+                 // otherwise, use a small fixed perturbation.
+                 if (Math.abs(simplex[i + 1][i]) > 1e-9) {
+                    simplex[i + 1][i] *= (1.0 + perturbation);
+                 } else {
+                     simplex[i + 1][i] = perturbation;
+                 }
+                 fSimplex[i + 1] = function.evaluate(simplex[i + 1]);
+                 evaluations++;
             }
-            
-            // Both min and max are unlimited, try a reasonable set of values
-            // Use only non-negative values for dimension parameters
-            double[] valuesToTry = {0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0};
-            for (double value : valuesToTry) {
-                if (cancelled) return;
-                param.currentValue = value;
-                optimizeRecursive(paramIndex + 1);
-            }
-            return;
-        } else if (param.currentMin == Double.NEGATIVE_INFINITY) {
-            // Min is unlimited but max is not
-            if ("finCount".equals(param.name)) {
-                // For finCount, use integer values up to max
-                int maxVal = (int)Math.min(8, param.currentMax);
-                for (int i = 1; i <= maxVal && !cancelled; i++) {
-                    param.currentValue = i;
-                    optimizeRecursive(paramIndex + 1);
+
+            for (int iteration = 0; iteration < maxIterations; iteration++) {
+                 // --- Report Progress ---
+                 if (progressListener != null) {
+                    // Calculate current step relative to the overall estimated total
+                    int currentOverallStep = baseProgressStep + iteration;
+                    // Report progress: Phase 0, current overall step, total estimated steps, 1 phase total
+                    progressListener.updateProgress(0, currentOverallStep, totalEstimatedProgressSteps, 1);
+                 }
+
+                // Order simplex points by function value (worst to best)
+                Integer[] order = new Integer[dimensions + 1];
+                for (int i = 0; i <= dimensions; i++) order[i] = i;
+                Arrays.sort(order, Comparator.comparingDouble(i -> fSimplex[i]));
+
+                int bestIdx = order[0];
+                int secondWorstIdx = order[dimensions - 1];
+                int worstIdx = order[dimensions];
+
+                // Check for convergence (simplex size)
+                 double maxDiff = 0;
+                 for (int i = 1; i <= dimensions; i++) {
+                     maxDiff = Math.max(maxDiff, Math.abs(fSimplex[order[i]] - fSimplex[bestIdx]));
+                 }
+                 if (maxDiff < tolerance) {
+                     //System.out.println("Converged after " + iteration + " iterations.");
+                     return simplex[bestIdx];
+                 }
+
+                // Calculate centroid (excluding the worst point)
+                double[] centroid = new double[dimensions];
+                for (int i = 0; i < dimensions; i++) { // Loop through dimensions
+                    for (int j = 0; j <= dimensions; j++) { // Loop through simplex points
+                        if (j != worstIdx) {
+                            centroid[i] += simplex[j][i];
+                        }
+                    }
+                    centroid[i] /= dimensions;
                 }
-                return;
+
+                // Reflection
+                double[] reflected = new double[dimensions];
+                for (int i = 0; i < dimensions; i++) {
+                    reflected[i] = centroid[i] + NM_ALPHA * (centroid[i] - simplex[worstIdx][i]);
+                }
+                double fReflected = function.evaluate(reflected);
+                evaluations++;
+
+                if (fReflected >= fSimplex[bestIdx] && fReflected < fSimplex[secondWorstIdx]) {
+                    // Accept reflected point
+                    System.arraycopy(reflected, 0, simplex[worstIdx], 0, dimensions);
+                    fSimplex[worstIdx] = fReflected;
+                    continue;
+                }
+
+                // Expansion
+                if (fReflected < fSimplex[bestIdx]) {
+                    double[] expanded = new double[dimensions];
+                    for (int i = 0; i < dimensions; i++) {
+                        expanded[i] = centroid[i] + NM_GAMMA * (reflected[i] - centroid[i]);
+                    }
+                    double fExpanded = function.evaluate(expanded);
+                    evaluations++;
+
+                    if (fExpanded < fReflected) {
+                        // Accept expanded point
+                        System.arraycopy(expanded, 0, simplex[worstIdx], 0, dimensions);
+                        fSimplex[worstIdx] = fExpanded;
             } else {
-                // For non-finCount parameters, try a few values below max
-                // and also include max itself, ensuring non-negative values
-                double maxVal = param.currentMax;
-                double[] valuesToTry = {0.0, maxVal/16, maxVal/8, maxVal/4, maxVal/2, maxVal};
-                for (double value : valuesToTry) {
-                    if (cancelled) return;
-                    param.currentValue = value;
-                    optimizeRecursive(paramIndex + 1);
+                        // Accept reflected point
+                        System.arraycopy(reflected, 0, simplex[worstIdx], 0, dimensions);
+                        fSimplex[worstIdx] = fReflected;
+                    }
+                    continue;
                 }
-                return;
-            }
-        } else if (!param.hasMaxLimit) {
-            // Max is unlimited but min is not, try a few values starting from min
-            double minVal = Math.max(0, param.currentMin);
-            double value = minVal;
-            
-            // Special handling for zero-based parameters
-            if (minVal == 0 && param.step > 0) {
-                value = param.step; // Start with the first step size
-                for (int i = 0; i < 5 && !cancelled; i++) {
-                    param.currentValue = value;
-                    optimizeRecursive(paramIndex + 1);
-                    value *= 2;  // Double the value each time
+
+                // Contraction
+                double[] contracted = new double[dimensions];
+                if (fReflected < fSimplex[worstIdx]) {
+                    // Outside contraction
+                    for (int i = 0; i < dimensions; i++) {
+                        contracted[i] = centroid[i] + NM_RHO * (reflected[i] - centroid[i]);
                 }
             } else {
-                for (int i = 0; i < 5 && !cancelled; i++) { 
-                    param.currentValue = value;
-                    optimizeRecursive(paramIndex + 1);
-                    value *= 2;
+                    // Inside contraction
+                    for (int i = 0; i < dimensions; i++) {
+                        contracted[i] = centroid[i] - NM_RHO * (centroid[i] - simplex[worstIdx][i]);
+                    }
+                }
+                double fContracted = function.evaluate(contracted);
+                evaluations++;
+
+                if (fContracted < fSimplex[worstIdx]) {
+                    // Accept contracted point
+                    System.arraycopy(contracted, 0, simplex[worstIdx], 0, dimensions);
+                    fSimplex[worstIdx] = fContracted;
+                    continue;
+                }
+
+                // Shrink
+                for (int i = 1; i <= dimensions; i++) { // Shrink towards the best point
+                    int currentIdx = order[i];
+                    for (int j = 0; j < dimensions; j++) {
+                        simplex[currentIdx][j] = simplex[bestIdx][j] + NM_SIGMA * (simplex[currentIdx][j] - simplex[bestIdx][j]);
+                    }
+                    fSimplex[currentIdx] = function.evaluate(simplex[currentIdx]);
+                    evaluations++;
                 }
             }
-            return;
-        } else if (Math.abs(param.currentMax - param.currentMin) < 1e-6) {
-            // Min equals max, just use that value
-            param.currentValue = param.currentMin;
-            optimizeRecursive(paramIndex + 1);
-            return;
-        }
 
-        // Standard case: step from min to max
-        if ("finCount".equals(param.name)) {
-            // For finCount, use integer values only
-            int minVal = (int)Math.max(1, Math.ceil(param.currentMin));
-            int maxVal = (int)Math.min(8, Math.floor(param.currentMax));
-            for (int value = minVal; value <= maxVal && !cancelled; value++) {
-                param.currentValue = value;
-                optimizeRecursive(paramIndex + 1);
-            }
-        } else {
-            // For other parameters, use regular stepping
-            double min = Math.max(0, param.currentMin); // Ensure non-negative values
-            for (double value = min; value <= param.currentMax && !cancelled; value += param.step) {
-                param.currentValue = value;
-                optimizeRecursive(paramIndex + 1);
-            }
+            // Return the best point found after max iterations
+            Integer[] finalOrder = new Integer[dimensions + 1];
+            for(int i=0; i<=dimensions; i++) finalOrder[i] = i;
+            Arrays.sort(finalOrder, Comparator.comparingDouble(i -> fSimplex[i]));
+            //System.out.println("Reached max iterations (" + maxIterations + "). Evaluations: " + evaluations);
+            return simplex[finalOrder[0]];
         }
     }
 
+    // Restore the helper method to get display names for logging
     private String getDisplayName(String paramName) {
         switch (paramName) {
             case "thickness": return "Fin Thickness";
@@ -360,171 +435,223 @@ public class Optimizer {
             case "finCount": return "Number of Fins";
             case "noseLength": return "Nose Cone Length";
             case "noseWallThickness": return "Nose Cone Wall Thickness";
-            default: return paramName;
+            // Add other potential internal names if needed
+            default: return paramName; // Fallback to internal name
         }
     }
 
-    private void evaluateConfiguration() {
-        // Update status listener if needed (consider if this level of detail is still desired)
-        if (statusListener != null) {
-            StringBuilder status = new StringBuilder();
-            for (FinParameter param : parameters) {
-                // Use internal param.name for key lookup
-                if (config.enabledParams.getOrDefault(param.name, true)) {
-                    status.append(String.format("%s=%.2f ", param.name, param.currentValue));
-                }
+    // Modified evaluateConfiguration to return error score directly
+    // and accept parameters as input array
+    private double evaluateConfigurationWithError(double[] currentParamValues, List<FinParameter> enabledParams) {
+        if (cancelled) return Double.MAX_VALUE; // Return high error if cancelled
+
+        // Map the input array values to the correct FinParameter objects
+        for (int i = 0; i < enabledParams.size(); i++) {
+            FinParameter param = enabledParams.get(i);
+            double rawValue = currentParamValues[i];
+
+            // --- CLAMPING ---
+            // Clamp the value to the parameter's current min/max bounds before applying
+            rawValue = Math.max(param.currentMin, Math.min(param.currentMax, rawValue));
+        if ("finCount".equals(param.name)) {
+                rawValue = Math.round(rawValue); // Ensure fin count is integer after clamping
             }
-            // Add parachute status if needed
-            if (config.enabledParams.getOrDefault("Stage 1 Parachute", true) && stage1Parachute != null) {
-                 status.append(String.format("Stage1Parachute=%s ", currentStage1Parachute));
+            // Store the (potentially clamped) raw value for this evaluation
+             param.currentValue = rawValue;
+             // ----------------
+
+            double convertedValue = param.converter.apply(rawValue);
+
+            // Apply the clamped and converted value
+            try {
+                 switch (param.name) {
+                     case "thickness": fins.setThickness(convertedValue); break;
+                     case "rootChord": fins.setLength(convertedValue); break;
+                     case "height": fins.setHeight(convertedValue); break;
+                     case "finCount": fins.setFinCount((int) rawValue); break; // Use raw clamped value
+                     case "noseLength": noseCone.setLength(convertedValue); break;
+                     case "noseWallThickness": noseCone.setThickness(convertedValue); break;
+                 }
+            } catch (Exception e) {
+                 // Handle potential exceptions during component updates (e.g., invalid values)
+                 log("Error setting parameter " + param.name + " to " + rawValue + ": " + e.getMessage());
+                 return Double.MAX_VALUE; // Return high error if setting fails
             }
-             if (config.enabledParams.getOrDefault("Stage 2 Parachute", true) && stage2Parachute != null) {
-                 status.append(String.format("Stage2Parachute=%s ", currentStage2Parachute));
-            }
-            statusListener.updateStatus(status.toString());
         }
 
-        try {
-            // Apply numeric parameter values only if enabled
-            for (FinParameter param : parameters) {
-                // Use internal param.name as key
-                boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
-                
-                if (!isEnabled) {
-                    // If parameter is disabled, ensure it's set to the original value
-                    switch (param.name) {
-                        case "thickness":
-                            fins.setThickness(originalValues.get("thickness"));
-                            break;
-                        case "rootChord":
-                            fins.setLength(originalValues.get("rootChord"));
-                            break;
-                        case "height":
-                            fins.setHeight(originalValues.get("height"));
-                            break;
-                        case "finCount":
-                            fins.setFinCount(originalValues.get("finCount").intValue());
-                            break;
-                        case "noseLength":
-                            noseCone.setLength(originalValues.get("noseLength"));
-                            break;
-                        case "noseWallThickness":
-                            noseCone.setThickness(originalValues.get("noseWallThickness"));
-                            break;
-                    }
-                } else {
-                    // If parameter is enabled, apply the current test value
-                    switch (param.name) {
-                        case "thickness":
-                            fins.setThickness(param.converter.apply(param.currentValue));
-                            break;
-                        case "rootChord":
-                            fins.setLength(param.converter.apply(param.currentValue));
-                            break;
-                        case "height":
-                            fins.setHeight(param.converter.apply(param.currentValue));
-                            break;
-                        case "finCount":
-                            fins.setFinCount((int)Math.round(param.currentValue));
-                            break;
-                        case "noseLength":
-                            noseCone.setLength(param.converter.apply(param.currentValue));
-                            break;
-                        case "noseWallThickness":
-                            noseCone.setThickness(param.converter.apply(param.currentValue));
-                            break;
-                    }
-                }
-            }
-            
-            // Apply parachute presets if parachutes are available and enabled
-            if (stage1Parachute != null) {
-                boolean isEnabled = config.enabledParams.getOrDefault("Stage 1 Parachute", true);
-                if (isEnabled) {
-                    ComponentPreset preset = ParachuteHelper.findPresetByDisplayName(currentStage1Parachute);
-                    if (preset != null) {
-                        ParachuteHelper.applyPreset(stage1Parachute, preset);
-                    } else if ("None".equals(currentStage1Parachute)) {
-                        // Restore original preset if "None" selected
-                        ParachuteHelper.applyPreset(stage1Parachute, originalStage1Preset);
-                    }
-                }
-            }
-            
-            if (stage2Parachute != null) {
-                boolean isEnabled = config.enabledParams.getOrDefault("Stage 2 Parachute", true);
-                if (isEnabled) {
-                    ComponentPreset preset = ParachuteHelper.findPresetByDisplayName(currentStage2Parachute);
-                    if (preset != null) {
-                        ParachuteHelper.applyPreset(stage2Parachute, preset);
-                    } else if ("None".equals(currentStage2Parachute)) {
-                        // Restore original preset if "None" selected
-                        ParachuteHelper.applyPreset(stage2Parachute, originalStage2Preset);
-                    }
-                }
-            }
+        // Apply current parachute presets (managed outside this function by the main loop)
+        applyCurrentParachuteSettings();
 
+        try {
             rocket.enableEvents();
             FlightConfigurationId configId = document.getSelectedConfiguration().getId();
-            rocket.fireComponentChangeEvent(ComponentChangeEvent.AERODYNAMIC_CHANGE, configId);
+            // Fire fewer events if possible, maybe just TREE_CHANGE? Test needed.
+            rocket.fireComponentChangeEvent(ComponentChangeEvent.AERODYNAMIC_CHANGE | ComponentChangeEvent.MASS_CHANGE | ComponentChangeEvent.MOTOR_CHANGE);
 
+            // --- Stability Check ---
             double stability = calculateStability();
+            // Check if stability calculation failed (returned NaN)
+            if (Double.isNaN(stability)) {
+                 logCurrent("Skipping (NM)", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Invalid CP/Stability");
+                 return Double.MAX_VALUE; // Return high error for invalid stability
+            }
+            // Check if stability is outside the user-defined range
             if (stability < config.stabilityRange[0] || stability > config.stabilityRange[1]) {
-                logCurrent("Skipping", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Stability out of range");
-                return;
+                logCurrent("Skipping (NM)", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Stability out of range");
+                // Return a penalty proportional to how far out of bounds stability is
+                double penalty = Math.max(config.stabilityRange[0] - stability, stability - config.stabilityRange[1]);
+                 return 1000.0 + penalty * 100; // Large base penalty + proportional penalty
             }
 
-            SimulationStepper.SimulationResult result = new SimulationStepper(rocket, baseOptions).runSimulation();
+            // --- Simulation ---
+            SimulationStepper.SimulationResult result;
+             try {
+                result = new SimulationStepper(rocket, baseOptions).runSimulation();
+             } catch (SimulationException e) {
+                 logCurrent("Failed (NM Sim)", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Sim Error: " + e.getMessage());
+                 return Double.MAX_VALUE; // Return high error on simulation failure
+             }
+             
             double apogee = result.altitude;
             double duration = result.duration;
 
+            // --- Calculate Scores ---
             double altitudeScore = config.enabledParams.getOrDefault("Altitude Score", true) ?
-                    calculateAltitudeScore(apogee, config.altitudeRange[0], config.altitudeRange[1]) : 0;
+                    calculateAltitudeScore(apogee, config.altitudeRange[0], config.altitudeRange[1]) : 0.0;
             double durationScore = config.enabledParams.getOrDefault("Duration Score", true) ?
-                    calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]) : 0;
+                    calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]) : 0.0;
             double totalError = altitudeScore + durationScore;
 
-            if (logListener != null) {
-                StringBuilder interimData = new StringBuilder();
-                // Add numeric parameters directly from components (converted to cm for consistency if needed)
-                interimData.append(String.format("thickness=%.2f|rootChord=%.2f|height=%.2f|finCount=%.0f|noseLength=%.2f|noseWallThickness=%.2f",
-                        fins.getThickness() * 100, // Convert m to cm
-                        fins.getLength() * 100,    // Convert m to cm
-                        fins.getHeight() * 100,    // Convert m to cm
-                        (double)fins.getFinCount(),
-                        noseCone.getLength() * 100, // Convert m to cm
-                        noseCone.getThickness() * 100 // Convert m to cm
-                        ));
-                
-                // Add parachute values as string parameters (not parsed as doubles)
-                interimData.append(String.format("|stage1Parachute=%s|stage2Parachute=%s", 
-                        currentStage1Parachute, currentStage2Parachute));
-                
-                // Add simulation results
-                interimData.append(String.format("|apogee=%.1f|duration=%.2f|altitudeScore=%.1f|durationScore=%.2f|totalScore=%.2f",
-                        apogee, duration, altitudeScore, durationScore, altitudeScore + durationScore));
-                
-                logListener.log("INTERIM:" + interimData.toString());
-            }
+            // --- Update Best Values if this is better ---
+             // Store current parameter raw values for potential update
+             Map<String, Double> currentRawValues = new HashMap<>();
+             for(FinParameter p : enabledParams) {
+                 currentRawValues.put(p.name, p.currentValue); // Use the potentially clamped value
+             }
+             // Include disabled params with their original values
+             for(FinParameter p : parameters) {
+                 if (!enabledParams.contains(p)) {
+                     currentRawValues.put(p.name, originalValues.get(p.name));
+                 }
+             }
 
             if (totalError < bestError) {
                 bestError = totalError;
-                updateBestValues(apogee, duration, altitudeScore, durationScore);
-                logCurrent("Best", stability, apogee, duration, altitudeScore, durationScore, null);
-                rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE);
+                // Update bestValues map with the current parameter values and results
+                bestValues.clear();
+                bestValues.putAll(currentRawValues); // Store raw values (cm/count)
+                bestValues.put("apogee", apogee);
+                bestValues.put("duration", duration);
+                bestValues.put("altitudeScore", altitudeScore);
+                bestValues.put("durationScore", durationScore);
+                bestValues.put("totalScore", totalError);
+                // Save the current parachute selections associated with this best result
+                bestStage1Parachute = currentStage1Parachute;
+                bestStage2Parachute = currentStage2Parachute;
+
+                logCurrent("Best (NM)", stability, apogee, duration, altitudeScore, durationScore, null);
+                 // Fire tree change event *only* when a new best is found to potentially update UI previews?
+                 // Might be too frequent. Consider updating UI only at the end.
+                 // rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE);
             }
+
+            // --- Log Interim Results (Optional - can be verbose) ---
+            if (logListener != null) {
+                 // Log less frequently or provide summary status?
+                 // Example: Log every 10 evaluations
+                 // if (evaluationCount % 10 == 0) { ... log interim ... }
+                 // For now, logging every evaluation for debugging:
+                 logInterim(currentRawValues, apogee, duration, altitudeScore, durationScore, totalError);
+            }
+            
+            // Update status listener (optional)
+        if (statusListener != null) {
+                 // Provide a status update, maybe less frequently
+            StringBuilder status = new StringBuilder();
+                 for (FinParameter p : enabledParams) {
+                     status.append(String.format("%s=%.2f ", p.name, p.currentValue));
+                 }
+                 // Add parachute status
+            if (config.enabledParams.getOrDefault("Stage 1 Parachute", true) && stage1Parachute != null) {
+                      status.append(String.format("S1P=%s ", currentStage1Parachute.substring(0, Math.min(5, currentStage1Parachute.length())))); // Abbreviate
+            }
+             if (config.enabledParams.getOrDefault("Stage 2 Parachute", true) && stage2Parachute != null) {
+                      status.append(String.format("S2P=%s ", currentStage2Parachute.substring(0, Math.min(5, currentStage2Parachute.length())))); // Abbreviate
+            }
+                  status.append(String.format("Err=%.2f", totalError));
+            statusListener.updateStatus(status.toString());
+        }
+
+            return totalError; // Return the calculated error for Nelder-Mead
+
         } catch (Exception e) {
-            logCurrent("Failed", Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN, e.getMessage());
+            // Catch any other unexpected errors during evaluation
+            logCurrent("Failed (NM Eval)", Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Eval Error: " + e.getMessage());
+            e.printStackTrace(); // Log stack trace for debugging
+            return Double.MAX_VALUE; // Return high error
+        }
+    }
+
+    // Helper to apply current parachute settings
+    private void applyCurrentParachuteSettings() {
+            if (stage1Parachute != null) {
+                boolean isEnabled = config.enabledParams.getOrDefault("Stage 1 Parachute", true);
+             ComponentPreset preset = null;
+                if (isEnabled) {
+                 preset = ParachuteHelper.findPresetByDisplayName(currentStage1Parachute);
+             }
+             // If enabled and preset found, apply it. Otherwise, apply original (or leave if !isEnabled).
+             if (isEnabled) {
+                    if (preset != null) {
+                        ParachuteHelper.applyPreset(stage1Parachute, preset);
+                    } else if ("None".equals(currentStage1Parachute)) {
+                      ParachuteHelper.applyPreset(stage1Parachute, originalStage1Preset); // Restore original if 'None'
+                    }
+             } else {
+                  ParachuteHelper.applyPreset(stage1Parachute, originalStage1Preset); // Ensure original if disabled
+                }
+            }
+            if (stage2Parachute != null) {
+                boolean isEnabled = config.enabledParams.getOrDefault("Stage 2 Parachute", true);
+             ComponentPreset preset = null;
+                if (isEnabled) {
+                 preset = ParachuteHelper.findPresetByDisplayName(currentStage2Parachute);
+             }
+              if (isEnabled) {
+                    if (preset != null) {
+                        ParachuteHelper.applyPreset(stage2Parachute, preset);
+                    } else if ("None".equals(currentStage2Parachute)) {
+                      ParachuteHelper.applyPreset(stage2Parachute, originalStage2Preset); // Restore original if 'None'
+                  }
+              } else {
+                   ParachuteHelper.applyPreset(stage2Parachute, originalStage2Preset); // Ensure original if disabled
+              }
+         }
+    }
+
+    // Helper to log interim results
+    private void logInterim(Map<String, Double> currentRawValues, double apogee, double duration, double altScore, double durScore, double totalError) {
+         StringBuilder interimData = new StringBuilder("INTERIM:");
+         for (Map.Entry<String, Double> entry : currentRawValues.entrySet()) {
+             interimData.append(String.format("%s=%.2f|", entry.getKey(), entry.getValue()));
+         }
+         interimData.append(String.format("stage1Parachute=%s|stage2Parachute=%s|",
+                        currentStage1Parachute, currentStage2Parachute));
+         interimData.append(String.format("apogee=%.1f|duration=%.2f|altitudeScore=%.1f|durationScore=%.2f|totalScore=%.2f",
+                 apogee, duration, altScore, durScore, totalError));
+         if (logListener != null) {
+            logListener.log(interimData.toString());
         }
     }
 
     private double calculateAltitudeScore(double actualAltitude, double min, double max) {
         // If min is "unlimited" (negative infinity), only check upper bound
         if (min == Double.NEGATIVE_INFINITY) {
-            return (actualAltitude <= max) ? 0 : (actualAltitude - max);
+            // Check against POSITIVE_INFINITY max as well
+            return (max == Double.POSITIVE_INFINITY || actualAltitude <= max) ? 0 : (actualAltitude - max);
         }
-        // If max is "unlimited" (MAX_VALUE), only check lower bound
-        else if (max == Double.MAX_VALUE) {
+        // If max is "unlimited" (POSITIVE_INFINITY), only check lower bound
+        else if (max == Double.POSITIVE_INFINITY) {
             return (actualAltitude >= min) ? 0 : (min - actualAltitude);
         }
         // Both bounds are specified
@@ -541,10 +668,11 @@ public class Optimizer {
     private double calculateDurationScore(double actualDuration, double min, double max) {
         // If min is "unlimited" (negative infinity), only check upper bound
         if (min == Double.NEGATIVE_INFINITY) {
-            return (actualDuration <= max) ? 0 : (actualDuration - max) * 4;
+             // Check against POSITIVE_INFINITY max as well
+            return (max == Double.POSITIVE_INFINITY || actualDuration <= max) ? 0 : (actualDuration - max) * 4;
         }
-        // If max is "unlimited" (MAX_VALUE), only check lower bound
-        else if (max == Double.MAX_VALUE) {
+        // If max is "unlimited" (POSITIVE_INFINITY), only check lower bound
+        else if (max == Double.POSITIVE_INFINITY) {
             return (actualDuration >= min) ? 0 : (min - actualDuration) * 4;
         }
         // Both bounds are specified
@@ -558,326 +686,137 @@ public class Optimizer {
         }
     }
 
+    // Rewritten main optimization method using Nelder-Mead
     public void optimizeFins() {
-        // Reset cancel flag
         cancelled = false;
-        currentMajorStep = 0; // Reset progress
-        
-        for (FinParameter param : parameters) {
-            if (config.enabledParams.getOrDefault(param.name, true)) {
-                if (param.absoluteMin > param.absoluteMax) {
-                    throw new IllegalStateException("Invalid bounds for parameter: " + getDisplayName(param.name));
-                }
-            }
-        }
+        bestError = Double.MAX_VALUE; // Reset best error
+        bestValues.clear(); // Clear previous best values
+        currentMajorStep = 0; // Reset progress step counter
 
-        bestError = Double.MAX_VALUE;
-        
-        // Determine optimization type and calculate total steps
+        // 1. Identify enabled numeric parameters for optimization
+        List<FinParameter> enabledNumericParams = parameters.stream()
+                .filter(p -> config.enabledParams.getOrDefault(p.name, true))
+                .collect(Collectors.toList());
+
+        int dimensions = enabledNumericParams.size();
+
+        // 2. Check if any numeric parameters are enabled
+        boolean anyNumericParamsEnabled = dimensions > 0;
+        // Check if any parachutes are enabled for optimization
         boolean parachute1Enabled = config.enabledParams.getOrDefault("Stage 1 Parachute", true) && stage1Parachute != null;
         boolean parachute2Enabled = config.enabledParams.getOrDefault("Stage 2 Parachute", true) && stage2Parachute != null;
         boolean anyParachutesEnabled = parachute1Enabled || parachute2Enabled;
-        boolean anyNumericParamsEnabled = false;
-        for (FinParameter param : parameters) {
-            if (config.enabledParams.getOrDefault(param.name, true)) {
-                anyNumericParamsEnabled = true;
-                break;
-            }
-        }
-        boolean onlyParachutesEnabled = anyParachutesEnabled && !anyNumericParamsEnabled;
 
-        // Calculate total major steps for the progress bar
-        if (onlyParachutesEnabled) {
-            List<ComponentPreset> presets = ParachuteHelper.getAllParachutePresets();
-            int numPresets = (presets != null) ? presets.size() : 0;
-            int stage1Opts = parachute1Enabled ? (numPresets + 1) : 1; // +1 for "None"
-            int stage2Opts = parachute2Enabled ? (numPresets + 1) : 1; // +1 for "None"
-            totalMajorSteps = stage1Opts * stage2Opts;
-            optimizeParachutesOnly();
-        } else if (anyParachutesEnabled && anyNumericParamsEnabled) {
-            List<ComponentPreset> presets = ParachuteHelper.getAllParachutePresets();
-            int numPresets = (presets != null) ? presets.size() : 0;
-            int stage1Opts = parachute1Enabled ? (numPresets + 1) : 1;
-            int stage2Opts = parachute2Enabled ? (numPresets + 1) : 1;
-            totalMajorSteps = stage1Opts * stage2Opts * phases;
-            optimizeAllParameters();
-        } else if (anyNumericParamsEnabled) { // Only numeric
-            totalMajorSteps = phases;
-            optimizeAllParameters(); // This method handles the case where optimizeParachutes is false
-        } else {
-            // Nothing enabled?
-            totalMajorSteps = 1;
-            if (progressListener != null) {
-                progressListener.updateProgress(0, 1, 1, 1);
-            }
-            logListener.log("No parameters enabled for optimization.");
-        }
-        
-        // Ensure progress bar reaches 100% if not cancelled
-        if (!cancelled && progressListener != null) {
-             progressListener.updateProgress(0, totalMajorSteps, totalMajorSteps, 1);
-        }
-
-        logFinalResults();
-    }
-
-    // Method to optimize only parachutes, without running the recursive parameter optimization
-    private void optimizeParachutesOnly() {
-        if (logListener != null) {
-            logListener.log("Optimizing parachutes only");
-        }
-        
-        // Get parachute presets
-        List<ComponentPreset> parachutePresets = ParachuteHelper.getAllParachutePresets();
-        if (parachutePresets == null || parachutePresets.isEmpty()) {
-            if (logListener != null) {
-                logListener.log("No parachute presets found");
-            }
+        if (!anyNumericParamsEnabled && !anyParachutesEnabled) {
+            log("No parameters enabled for optimization.");
+            if (progressListener != null) progressListener.updateProgress(0, 1, 1, 1); // Show completion
             return;
         }
         
-        // Check which parachutes are enabled
-        boolean parachute1Enabled = config.enabledParams.getOrDefault("Stage 1 Parachute", true) && stage1Parachute != null;
-        boolean parachute2Enabled = config.enabledParams.getOrDefault("Stage 2 Parachute", true) && stage2Parachute != null;
-        
-        // Create lists of parachute options to try
-        List<String> stage1Options = new ArrayList<>();
-        if (parachute1Enabled) {
-            stage1Options.add("None"); // No parachute option
-            for (ComponentPreset preset : parachutePresets) {
-                stage1Options.add(ParachuteHelper.getPresetDisplayName(preset));
-            }
-        } else {
-            // Just use the current parachute setting if not enabled for optimization
-            stage1Options.add(currentStage1Parachute);
-        }
-        
-        List<String> stage2Options = new ArrayList<>();
-        if (parachute2Enabled) {
-            stage2Options.add("None"); // No parachute option
-            for (ComponentPreset preset : parachutePresets) {
-                stage2Options.add(ParachuteHelper.getPresetDisplayName(preset));
-            }
-        } else {
-            // Just use the current parachute setting if not enabled for optimization
-            stage2Options.add(currentStage2Parachute);
-        }
-        
-        // Calculate total evaluations for progress tracking
-        int totalEvaluations = stage1Options.size() * stage2Options.size();
-        int currentEvaluation = 0;
-        
-        // Try different parachute combinations
-        for (String stage1Option : stage1Options) {
-            for (String stage2Option : stage2Options) {
-                if (cancelled) break; // Break inner loop (stage2Options)
-                
-                currentMajorStep++; // Increment overall progress
-                if (progressListener != null) {
-                    // Report progress based on overall steps
-                    progressListener.updateProgress(0, currentMajorStep, totalMajorSteps, 1);
-                }
-                
-                // Log which parachute settings we're trying with clear indication of what's changing
-                if (logListener != null) {
-                    StringBuilder message = new StringBuilder("Trying parachute combination: ");
-                    if (parachute1Enabled) {
-                        message.append("Stage 1 = ").append(stage1Option);
-                    } else {
-                        message.append("Stage 1 = unchanged (").append(currentStage1Parachute).append(")");
-                    }
-                    message.append(", ");
-                    if (parachute2Enabled) {
-                        message.append("Stage 2 = ").append(stage2Option);
-                    } else {
-                        message.append("Stage 2 = unchanged (").append(currentStage2Parachute).append(")");
-                    }
-                    logListener.log(message.toString());
-                }
-                
-                // Only change parachutes that are enabled for optimization
-                if (parachute1Enabled) {
-                    currentStage1Parachute = stage1Option;
-                }
-                
-                if (parachute2Enabled) {
-                    currentStage2Parachute = stage2Option;
-                }
-                
-                // Apply parachute presets
-                if (stage1Parachute != null && parachute1Enabled) {
-                    ComponentPreset preset = ParachuteHelper.findPresetByDisplayName(stage1Option);
-                    if (preset != null) {
-                        ParachuteHelper.applyPreset(stage1Parachute, preset);
-                    } else if ("None".equals(stage1Option)) {
-                        // Restore original preset if "None" selected
-                        ParachuteHelper.applyPreset(stage1Parachute, originalStage1Preset);
-                    }
-                }
-                
-                if (stage2Parachute != null && parachute2Enabled) {
-                    ComponentPreset preset = ParachuteHelper.findPresetByDisplayName(stage2Option);
-                    if (preset != null) {
-                        ParachuteHelper.applyPreset(stage2Parachute, preset);
-                    } else if ("None".equals(stage2Option)) {
-                        // Restore original preset if "None" selected
-                        ParachuteHelper.applyPreset(stage2Parachute, originalStage2Preset);
-                    }
-                }
-                
-                rocket.enableEvents();
-                FlightConfigurationId configId = document.getSelectedConfiguration().getId();
-                rocket.fireComponentChangeEvent(ComponentChangeEvent.AERODYNAMIC_CHANGE, configId);
-                
-                // Run simulation and evaluate result
-                try {
-                    double stability = calculateStability();
-                    if (stability < config.stabilityRange[0] || stability > config.stabilityRange[1]) {
-                        logCurrent("Skipping", stability, Double.NaN, Double.NaN, Double.NaN, Double.NaN, "Stability out of range");
-                        continue;
-                    }
-                    
-                    SimulationStepper.SimulationResult result = new SimulationStepper(rocket, baseOptions).runSimulation();
-                    double apogee = result.altitude;
-                    double duration = result.duration;
-                    
-                    double altitudeScore = config.enabledParams.getOrDefault("Altitude Score", true) ?
-                            calculateAltitudeScore(apogee, config.altitudeRange[0], config.altitudeRange[1]) : 0;
-                    double durationScore = config.enabledParams.getOrDefault("Duration Score", true) ?
-                            calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]) : 0;
-                    double totalError = altitudeScore + durationScore;
-                    
-                    // Update the interim values for UI display
-                    if (logListener != null) {
-                        StringBuilder interimData = new StringBuilder();
-                        // Add numeric parameters directly from components (converted to cm for consistency if needed)
-                        interimData.append(String.format("thickness=%.2f|rootChord=%.2f|height=%.2f|finCount=%.0f|noseLength=%.2f|noseWallThickness=%.2f",
-                                fins.getThickness() * 100, // Convert m to cm
-                                fins.getLength() * 100,    // Convert m to cm
-                                fins.getHeight() * 100,    // Convert m to cm
-                                (double)fins.getFinCount(),
-                                noseCone.getLength() * 100, // Convert m to cm
-                                noseCone.getThickness() * 100 // Convert m to cm
-                                ));
-                        
-                        // Add parachute values as string parameters (not parsed as doubles)
-                        interimData.append(String.format("|stage1Parachute=%s|stage2Parachute=%s", 
-                                currentStage1Parachute, currentStage2Parachute));
-                        
-                        // Add simulation results
-                        interimData.append(String.format("|apogee=%.1f|duration=%.2f|altitudeScore=%.1f|durationScore=%.2f|totalScore=%.2f",
-                                apogee, duration, altitudeScore, durationScore, altitudeScore + durationScore));
-                        
-                        logListener.log("INTERIM:" + interimData.toString());
-                    }
-                    
-                    if (totalError < bestError) {
-                        bestError = totalError;
-                        
-                        // Update the best values - fetch current numeric values from components
-                        Map<String, Double> currentValues = new HashMap<>();
-                        currentValues.put("thickness", fins.getThickness() * 100);
-                        currentValues.put("rootChord", fins.getLength() * 100);
-                        currentValues.put("height", fins.getHeight() * 100);
-                        currentValues.put("finCount", (double) fins.getFinCount());
-                        currentValues.put("noseLength", noseCone.getLength() * 100);
-                        currentValues.put("noseWallThickness", noseCone.getThickness() * 100);
-                        // Add simulation results
-                        currentValues.put("apogee", apogee);
-                        currentValues.put("duration", duration);
-                        currentValues.put("altitudeScore", altitudeScore);
-                        currentValues.put("durationScore", durationScore);
-                        currentValues.put("totalScore", altitudeScore + durationScore);
-                        bestValues.clear();
-                        bestValues.putAll(currentValues);
-                        
-                        // Save the current parachute selections with the best values
-                        bestStage1Parachute = currentStage1Parachute;
-                        bestStage2Parachute = currentStage2Parachute;
-                        
-                        logCurrent("Best", stability, apogee, duration, altitudeScore, durationScore, null);
-                        rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE);
-                    }
-                } catch (Exception e) {
-                    logCurrent("Failed", Double.NaN, Double.NaN, Double.NaN, Double.NaN, Double.NaN, e.getMessage());
-                }
-            } // End inner loop (stage2Options)
-            // Check for cancellation *after* the inner loop finishes
-            if (cancelled) break; // Break outer loop (stage1Options)
-        }
-    }
-
-    // Method to optimize all parameters, including parachutes if enabled
-    private void optimizeAllParameters() {
-        // Check which parachutes are enabled
-        boolean parachute1Enabled = config.enabledParams.getOrDefault("Stage 1 Parachute", true) && stage1Parachute != null;
-        boolean parachute2Enabled = config.enabledParams.getOrDefault("Stage 2 Parachute", true) && stage2Parachute != null;
-        
-        // Get parachute presets if any parachute is enabled
+        // 3. Prepare parachute options
         List<ComponentPreset> parachutePresets = null;
         if (parachute1Enabled || parachute2Enabled) {
             parachutePresets = ParachuteHelper.getAllParachutePresets();
         }
+        List<String> stage1Options = createParachuteOptions(parachute1Enabled, parachutePresets, originalStage1Preset != null ? ParachuteHelper.getPresetDisplayName(originalStage1Preset) : "None");
+        List<String> stage2Options = createParachuteOptions(parachute2Enabled, parachutePresets, originalStage2Preset != null ? ParachuteHelper.getPresetDisplayName(originalStage2Preset) : "None");
         
-        // Whether to actually try different parachute combinations
-        boolean optimizeParachutes = (parachutePresets != null && !parachutePresets.isEmpty());
+        // Calculate total major steps (parachute combinations)
+        int totalParachuteCombinations = Math.max(1, stage1Options.size() * stage2Options.size());
         
-        if (optimizeParachutes) {
-            if (logListener != null) {
-                logListener.log("Including parachute optimization");
-            }
-            
-            // Create lists of parachute options to try
-            List<String> stage1Options = createParachuteOptions(parachute1Enabled, parachutePresets, currentStage1Parachute);
-            List<String> stage2Options = createParachuteOptions(parachute2Enabled, parachutePresets, currentStage2Parachute);
-            
-            // Try different parachute combinations
-            for (String stage1Option : stage1Options) {
-                for (String stage2Option : stage2Options) {
-                    if (cancelled) break;
-                    
-                    if (logListener != null) {
-                        logListener.log("Trying parachute combination: Stage 1 = " + 
-                            (parachute1Enabled ? stage1Option : "unchanged") + 
-                            ", Stage 2 = " + (parachute2Enabled ? stage2Option : "unchanged"));
-                    }
-                    
-                    // Apply parachute presets only if enabled
-                    applyParachutePreset(parachute1Enabled, stage1Parachute, stage1Option, originalStage1Preset);
-                    applyParachutePreset(parachute2Enabled, stage2Parachute, stage2Option, originalStage2Preset);
-                    
-                    // Run optimization phases for this parachute combination
-                    int currentPhase; // Local variable for phase within this combo
-                    for (currentPhase = 0; currentPhase < phases; currentPhase++) {
-                        currentMajorStep++; // Increment overall progress
-                        if (progressListener != null) {
-                            progressListener.updateProgress(0, currentMajorStep, totalMajorSteps, 1); // Use overall progress
-                        }
-                        if (bestError < errorThreshold || cancelled) break;
-                        if (currentPhase > 0) adjustParametersForNextPhase();
-                        optimizeRecursive(0);
-                        if (cancelled) break;
-                    }
-                }
-                if (cancelled) break; // Break outer loop if cancelled
-            }
-        } else {
-            // Run regular optimization with no parachute options
-            if (logListener != null) {
-                logListener.log("Running optimization without parachutes");
-            }
-            
-            int currentPhase; // Local variable for phase
-            for (currentPhase = 0; currentPhase < phases; currentPhase++) {
-                currentMajorStep++; // Increment overall progress
-                if (progressListener != null) {
-                    progressListener.updateProgress(0, currentMajorStep, totalMajorSteps, 1); // Use overall progress
-                }
-                if (bestError < errorThreshold || cancelled) break;
-                if (currentPhase > 0) adjustParametersForNextPhase();
-                optimizeRecursive(0);
+        // Calculate total *estimated* steps for progress reporting
+        // Multiply parachute combos by max NM iterations if numeric params are enabled
+        int totalEstimatedSteps = totalParachuteCombinations * (anyNumericParamsEnabled ? NM_MAX_ITERATIONS : 1);
+        if (totalEstimatedSteps == 0) totalEstimatedSteps = 1; // Ensure at least 1
+
+        // 4. Define the objective function
+        ObjectiveFunction objectiveFunction = point -> evaluateConfigurationWithError(point, enabledNumericParams);
+
+        // 5. Iterate through parachute combinations and run Nelder-Mead
+        int parachuteComboIndex = 0; // Track which parachute combination we are on
+        for (String s1Option : stage1Options) {
+            for (String s2Option : stage2Options) {
                 if (cancelled) break;
-            }
+                parachuteComboIndex++;
+                currentMajorStep = parachuteComboIndex; // Update major step counter for logging/status
+
+                // Set current parachute combination
+                currentStage1Parachute = s1Option;
+                currentStage2Parachute = s2Option;
+                applyCurrentParachuteSettings(); // Apply them to the rocket model
+
+                 log(String.format("--- Starting Optimization for Parachutes: S1=%s, S2=%s ---",
+                                   currentStage1Parachute, currentStage2Parachute));
+
+                if (anyNumericParamsEnabled) {
+                    // Prepare initial guess for numeric parameters
+                     double[] initialGuess = new double[dimensions];
+                     for (int i = 0; i < dimensions; i++) {
+                         // Start guess from the middle of the allowed range or original value?
+                         // Using original value might be better if available and valid.
+                         FinParameter p = enabledNumericParams.get(i);
+                         initialGuess[i] = originalValues.getOrDefault(p.name, (p.currentMin + p.currentMax) / 2.0);
+                         // Ensure initial guess is within bounds
+                         initialGuess[i] = Math.max(p.currentMin, Math.min(p.currentMax, initialGuess[i]));
+                         if ("finCount".equals(p.name)) {
+                             initialGuess[i] = Math.round(initialGuess[i]);
+                         }
+                     }
+
+                    // Create and run Nelder-Mead optimizer
+                    NelderMeadOptimizer nmOptimizer = new NelderMeadOptimizer(objectiveFunction, dimensions, NM_TOLERANCE, NM_MAX_ITERATIONS);
+
+                    // --- Progress Listener Setup for NM ---
+                    if (progressListener != null) {
+                        // Calculate the base progress step for this parachute combination
+                        int baseProgressStep = (parachuteComboIndex - 1) * NM_MAX_ITERATIONS;
+                        // Pass the listener, base step, and total estimated steps to the optimizer
+                        nmOptimizer.setProgressListener(progressListener, baseProgressStep, totalEstimatedSteps);
+                    }
+                    // --------------------------------------
+
+                    double[] bestPoint = nmOptimizer.optimize(initialGuess);
+
+                    // The best result (parameters + score) is updated internally
+                    // by evaluateConfigurationWithError whenever a new global minimum is found.
+                    // We don't need to explicitly update bestValues here unless NM guarantees
+                    // the returned bestPoint corresponds *exactly* to the last recorded bestError.
+                    // It's safer to rely on the internal update within evaluateConfigurationWithError.
+
+                } else {
+                    // No numeric parameters, just evaluate this parachute combination directly
+                    evaluateConfigurationWithError(new double[0], enabledNumericParams); // Pass empty array
+                    if (progressListener != null) {
+                        // When only evaluating parachutes, report progress based on the combo index
+                        // Total steps here is just the number of parachute combinations
+                        progressListener.updateProgress(0, parachuteComboIndex, totalParachuteCombinations, 1);
+                    }
+                }
+
+                 log(String.format("--- Finished Optimization for Parachutes: S1=%s, S2=%s. Current Best Error: %.2f ---",
+                                   currentStage1Parachute, currentStage2Parachute, bestError));
+
+
+            } // End inner loop (stage 2 options)
+                    if (cancelled) break;
+        } // End outer loop (stage 1 options)
+
+
+        // 6. Finalization
+        if (!cancelled && progressListener != null) {
+            // Ensure progress bar reaches 100% using the total estimated steps
+            progressListener.updateProgress(0, totalEstimatedSteps, totalEstimatedSteps, 1); 
+        }
+        logFinalResults();
+
+        // Optionally, apply the absolute best found parameters back to the rocket model
+        if (!bestValues.isEmpty()) {
+            applyBestValuesToModel();
+        } else {
+            // If no better solution was found (or optimization failed early),
+            // revert to original values? Or leave as is? Reverting seems safer.
+            revertToOriginalValues(); // Revert components to initial state
+            applyCurrentParachuteSettings(); // Re-apply original parachute settings
         }
     }
 
@@ -889,11 +828,41 @@ public class Optimizer {
             for (ComponentPreset preset : presets) {
                 options.add(ParachuteHelper.getPresetDisplayName(preset));
             }
+            // Ensure the current setting is included if it's a valid preset or "None"
+            boolean currentFound = false;
+            for(String opt : options) {
+                if (opt.equals(currentSetting)) {
+                    currentFound = true;
+                    break;
+                }
+            }
+             // Add the original/current setting if it wasn't already in the list
+             // This handles custom parachutes or cases where the original wasn't a standard preset
+             if (!currentFound && currentSetting != null && !currentSetting.isEmpty()) {
+                 // Check if it's a known preset display name first
+                 boolean isKnownPreset = false;
+                 if (presets != null) {
+                    for(ComponentPreset p : presets) {
+                        if(ParachuteHelper.getPresetDisplayName(p).equals(currentSetting)) {
+                            isKnownPreset = true;
+                            break;
+                        }
+                    }
+                 }
+                 // Only add if it's not "None" and not a known preset already added
+                 if (!"None".equals(currentSetting) && !isKnownPreset) {
+                    options.add(currentSetting);
+                 } else if ("None".equals(currentSetting) && !options.contains("None")) {
+                     options.add("None"); // Make sure None is present if it was the original
+                 }
+             }
+
         } else {
             // Just use the current setting if not enabled or no presets
             options.add(currentSetting);
         }
-        return options;
+        // Remove duplicates just in case
+        return options.stream().distinct().collect(Collectors.toList());
     }
 
     // Helper method to apply parachute preset
@@ -913,101 +882,60 @@ public class Optimizer {
                 // Restore original preset if "None" selected
                 ParachuteHelper.applyPreset(parachute, originalPreset);
             }
+            // Or try to apply the original preset? Applying original seems safer if the name is unrecognized.
+            else if (!"None".equals(option) && preset == null) {
+                 log(String.format("Warning: Could not find preset for %s. Applying original preset instead.", option)); 
+                 ParachuteHelper.applyPreset(parachute, originalPreset);
+                 // Update the currentStage parachute name back to the original if we reverted
+                 if (parachute == stage1Parachute && originalPreset != null) currentStage1Parachute = ParachuteHelper.getPresetDisplayName(originalPreset);
+                 if (parachute == stage2Parachute && originalPreset != null) currentStage2Parachute = ParachuteHelper.getPresetDisplayName(originalPreset);
+            }
+        } else if (!enabled && parachute != null) {
+             // If optimization for this parachute is disabled, ensure it's set to its original state
+             ParachuteHelper.applyPreset(parachute, originalPreset);
         }
-    }
-
-    private void adjustParametersForNextPhase() {
-        for (FinParameter param : parameters) {
-            // Use internal param.name as key
-            boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
-            
-            if (!isEnabled) {
-                // If disabled, keep its value fixed at original, min/max set to original, step 0
-                param.currentValue = originalValues.get(param.name);
-                param.currentMin = originalValues.get(param.name);
-                param.currentMax = originalValues.get(param.name);
-                param.step = 0;
-                continue;
-            }
-
-            Double bestVal = bestValues.get(param.name);
-            if (bestVal == null) continue;
-
-            if ("finCount".equals(param.name)) {
-                param.step = Math.max(param.step * 0.5, 1.0);
-            } else {
-                param.step = Math.max(param.step * 0.5, 0.01);
-            }
-            
-            // Enforce absolute minimum first
-            param.currentMin = Math.max(param.absoluteMin, bestVal - param.step * 3);
-            
-            // Then enforce absolute maximum
-            if (param.hasMaxLimit) {
-                param.currentMax = Math.min(param.absoluteMax, bestVal + param.step * 3);
-            } else {
-                param.currentMax = bestVal + param.step * 3;
-            }
-
-            // Final safeguard against invalid ranges
-            param.currentMin = Math.min(param.currentMin, param.currentMax);
-        }
-    }
-
-    private int calculateTotalEvaluations() {
-        int total = 1;
-        for (FinParameter param : parameters) {
-            // Use internal param.name as key
-            boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
-            
-            if (!isEnabled) {
-                continue; // Skip disabled parameters
-            }
-            
-            // If min equals max, there's only 1 value to evaluate
-            if (Math.abs(param.currentMax - param.currentMin) < 1e-6) {
-                continue; // Only one evaluation needed when min==max
-            }
-            
-            int steps = (int) Math.max(1, ((param.currentMax - param.currentMin) / param.step) + 1);
-            total *= steps;
-        }
-        return Math.max(1, total); // Ensure at least 1 evaluation
     }
 
     private double getConvertedValue(String paramName) {
-        return parameters.stream().filter(p -> p.name.equals(paramName)).findFirst().map(p -> p.converter.apply(p.currentValue)).orElseThrow();
+        // Find the parameter by its internal name
+        FinParameter param = parameters.stream()
+            .filter(p -> p.name.equals(paramName))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("Unknown parameter name: " + paramName));
+
+        // Get the *best* raw value found, not the transient currentValue
+        double bestRawValue = bestValues.getOrDefault(paramName, originalValues.get(paramName));
+
+        return param.converter.apply(bestRawValue);
     }
 
     private double getRawValue(String paramName) {
-        return parameters.stream().filter(p -> p.name.equals(paramName)).findFirst().map(p -> p.currentValue).orElseThrow();
-    }
+        // Find the parameter by its internal name
+         FinParameter param = parameters.stream()
+            .filter(p -> p.name.equals(paramName))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("Unknown parameter name: " + paramName));
 
-    private void updateBestValues(double apogee, double duration, double altitudeScore, double durationScore) {
-        bestValues.clear();
-        parameters.forEach(p -> bestValues.put(p.name, p.currentValue));
-        bestValues.put("apogee", apogee);
-        bestValues.put("duration", duration);
-        bestValues.put("altitudeScore", altitudeScore);
-        bestValues.put("durationScore", durationScore);
-        bestValues.put("totalScore", altitudeScore + durationScore);
-        
-        // Save the current parachute selections with the best values
-        bestStage1Parachute = currentStage1Parachute;
-        bestStage2Parachute = currentStage2Parachute;
+        // Get the *best* raw value found
+        return bestValues.getOrDefault(paramName, originalValues.get(paramName));
     }
 
     private void logCurrent(String status, double stability, double apogee, double duration,
                             double altScore, double durScore, String reason) {
         StringBuilder log = new StringBuilder(status + ":");
+        // Log current values being *evaluated*
         for (FinParameter param : parameters) {
-            log.append(String.format(" %s=%.2f", param.name, param.currentValue));
+             // Only log enabled parameters for brevity? Or all? Log all for now.
+             log.append(String.format(" %s=%.2f", param.name, param.currentValue)); // Log the value being tested
         }
+         // Log current parachutes being tested
+         log.append(String.format(" S1P=%s S2P=%s", currentStage1Parachute, currentStage2Parachute));
 
-        log.append(String.format(" | Apogee=%.1fm (Δ=%.1f)", apogee, altScore));
-        log.append(String.format(" | Duration=%.2fs (Δ=%.2f)", duration, durScore));
-        log.append(String.format(" | Total Score=%.2f", altScore + durScore));
-        log.append(String.format(" | Stability=%.2f cal", stability));
+        // Log results if available
+        if (!Double.isNaN(apogee)) log.append(String.format(" | Apogee=%.1fm (Δ=%.1f)", apogee, altScore));
+        if (!Double.isNaN(duration)) log.append(String.format(" | Duration=%.2fs (Δ=%.2f)", duration, durScore));
+        if (!Double.isNaN(altScore) && !Double.isNaN(durScore)) log.append(String.format(" | Total Score=%.2f", altScore + durScore));
+        if (!Double.isNaN(stability)) log.append(String.format(" | Stability=%.2f cal", stability));
 
         if (reason != null) {
             log.append(" | Reason=").append(reason);
@@ -1020,15 +948,33 @@ public class Optimizer {
     }
 
     private void logFinalResults() {
-        String results = "\n=== Optimization Complete ===\n";
-        results += String.format("Altitude Score: %.1f%n", bestValues.get("altitudeScore"));
-        results += String.format("Duration Score: %.2f%n", bestValues.get("durationScore"));
-        results += String.format("Total Score: %.2f%n", bestValues.get("totalScore"));
-        for (Map.Entry<String, Double> entry : bestValues.entrySet()) {
-            if (!entry.getKey().endsWith("Score")) {
-                results += String.format("%s: %.2f%n", entry.getKey(), entry.getValue());
+        if (bestValues.isEmpty()) {
+             log("=== Optimization Complete (No improvement found or cancelled early) ===");
+             return;
+        }
+
+        String results = "=== Optimization Complete ===";
+        results += String.format("Best Total Score: %.2f%n", bestValues.get("totalScore"));
+        results += String.format("  Altitude Score: %.1f%n", bestValues.get("altitudeScore"));
+        results += String.format("  Duration Score: %.2f%n", bestValues.get("durationScore"));
+        results += String.format("Simulation Results:%n");
+        results += String.format("  Apogee: %.1f m%n", bestValues.get("apogee"));
+        results += String.format("  Duration: %.2f s%n", bestValues.get("duration"));
+        results += String.format("Parameters:%n");
+        // Log numeric parameters
+        for (FinParameter param : parameters) {
+            if (bestValues.containsKey(param.name)) {
+                 // Display raw value (cm/count) and potentially converted value (m) if different
+                 double rawVal = bestValues.get(param.name);
+                 double convertedVal = param.converter.apply(rawVal);
+                 String unit = param.name.equals("finCount") ? "" : " cm"; // Assuming raw values are cm or count
+                 results += String.format("  %s: %.2f%s%n", getDisplayName(param.name), rawVal, unit);
             }
         }
+         // Log best parachutes found
+         results += String.format("  Stage 1 Parachute: %s%n", bestStage1Parachute);
+         results += String.format("  Stage 2 Parachute: %s%n", bestStage2Parachute);
+
         if (logListener != null) {
             logListener.log(results);
         }
@@ -1050,8 +996,10 @@ public class Optimizer {
             conditions.setRollRate(0);
 
             Coordinate cp = aeroCalc.getWorstCP(config, conditions, new WarningSet());
+            // Return NaN if CP calculation failed
             if (cp.weight <= 1e-9) {
-                throw new RuntimeException("Invalid CP");
+                // log("Warning: Invalid CP calculated."); // Optional logging
+                return Double.NaN; 
             }
 
             double absoluteStability = cp.x - cg.x;
@@ -1062,13 +1010,18 @@ public class Optimizer {
                     caliber = Math.max(caliber, Math.max(sym.getForeRadius(), sym.getAftRadius()) * 2);
                 }
             }
-            if (caliber <= 0) {
-                throw new RuntimeException("Invalid caliber");
+            // Return NaN if caliber calculation fails
+            if (caliber <= 1e-9) { // Use small epsilon instead of 0
+                 // log("Warning: Invalid caliber calculated."); // Optional logging
+                 return Double.NaN;
             }
 
             return absoluteStability / caliber;
         } catch (Exception e) {
-            throw new RuntimeException("Stability calculation failed: " + e.getMessage(), e);
+            // Log the exception and return NaN for any other stability calculation failure
+            log("Error during stability calculation: " + e.getMessage());
+            // e.printStackTrace(); // Optionally print stack trace for debugging
+            return Double.NaN; 
         }
     }
 
@@ -1085,104 +1038,163 @@ public class Optimizer {
         return null;
     }
 
+    // Modified saveOptimizedDesign to use bestValues map
     public void saveOptimizedDesign(File file) throws Exception {
-        for (FinParameter param : parameters) {
-            String name = param.name;
-            double rawValue = bestValues.get(name);
-            double convertedValue = param.converter.apply(rawValue);
-            switch (name) {
-                case "thickness":
-                    fins.setThickness(convertedValue);
-                    break;
-                case "rootChord":
-                    fins.setLength(convertedValue);
-                    break;
-                case "height":
-                    fins.setHeight(convertedValue);
-                    break;
-                case "finCount":
-                    fins.setFinCount((int) Math.round(rawValue));
-                    break;
-                case "noseLength":
-                    noseCone.setLength(convertedValue);
-                    break;
-                case "noseWallThickness":
-                    noseCone.setThickness(convertedValue);
-                    break;
-                default:
-                    throw new IllegalStateException("Unexpected parameter: " + name);
-            }
+        if (bestValues.isEmpty()) {
+            throw new IllegalStateException("No optimized results available to save.");
         }
 
+        applyBestValuesToModel(); // Apply the best found values to the components
+
         rocket.enableEvents();
-        rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE | ComponentChangeEvent.AERODYNAMIC_CHANGE);
-        rocket.update();
+        // Fire necessary events to update calculations
+        rocket.fireComponentChangeEvent(ComponentChangeEvent.TREE_CHANGE | ComponentChangeEvent.AERODYNAMIC_CHANGE | ComponentChangeEvent.MASS_CHANGE | ComponentChangeEvent.MOTOR_CHANGE);
+        rocket.update(); // Ensure rocket state is fully updated
 
         try (FileOutputStream fos = new FileOutputStream(file)) {
             RocketSaver saver = new OpenRocketSaver();
             StorageOptions options = document.getDefaultStorageOptions();
-            saver.save(fos, document, options, new WarningSet(), new ErrorSet());
+            // Clear warnings/errors before saving?
+             WarningSet warnings = new WarningSet();
+             ErrorSet errors = new ErrorSet();
+            saver.save(fos, document, options, warnings, errors);
+             if (!errors.isEmpty()) {
+                 throw new IOException("Errors encountered during save: " + errors.toString());
+             }
+             if (!warnings.isEmpty()) {
+                 log("Warnings during save: " + warnings.toString());
+             }
         }
     }
 
+     // Helper method to apply the best found parameters to the model components
+     private void applyBestValuesToModel() {
+         if (bestValues.isEmpty()) return;
+
+         // Apply best numeric parameters
+         for (FinParameter param : parameters) {
+             if (bestValues.containsKey(param.name)) {
+                 double rawValue = bestValues.get(param.name);
+                 double convertedValue = param.converter.apply(rawValue);
+                 try {
+                     switch (param.name) {
+                         case "thickness": fins.setThickness(convertedValue); break;
+                         case "rootChord": fins.setLength(convertedValue); break;
+                         case "height": fins.setHeight(convertedValue); break;
+                         case "finCount": fins.setFinCount((int) Math.round(rawValue)); break;
+                         case "noseLength": noseCone.setLength(convertedValue); break;
+                         case "noseWallThickness": noseCone.setThickness(convertedValue); break;
+                     }
+                 } catch (Exception e) {
+                     log("Error applying best value for " + param.name + ": " + e.getMessage());
+                 }
+             } else {
+                 // If a parameter wasn't optimized/in bestValues, ensure it's set to original
+                  if (originalValues.containsKey(param.name)) {
+                     double rawValue = originalValues.get(param.name);
+                     double convertedValue = param.converter.apply(rawValue);
+                     try {
+                         switch (param.name) {
+                             case "thickness": fins.setThickness(convertedValue); break;
+                             case "rootChord": fins.setLength(convertedValue); break;
+                             case "height": fins.setHeight(convertedValue); break;
+                             case "finCount": fins.setFinCount((int) Math.round(rawValue)); break;
+                             case "noseLength": noseCone.setLength(convertedValue); break;
+                             case "noseWallThickness": noseCone.setThickness(convertedValue); break;
+                         }
+                      } catch (Exception e) {
+                         log("Error applying original value for " + param.name + ": " + e.getMessage());
+                      }
+                  }
+             }
+         }
+
+         // Apply best parachute settings
+         currentStage1Parachute = bestStage1Parachute; // Update current setting to best
+         currentStage2Parachute = bestStage2Parachute;
+         applyCurrentParachuteSettings(); // Apply the best presets
+     }
+
+    // updateParameterBounds needs to update currentMin/currentMax which are used for clamping
     public void updateParameterBounds(String paramName, double min, double max) {
-        if (min > max && max != Double.MAX_VALUE && min != Double.NEGATIVE_INFINITY) {
-            throw new IllegalArgumentException("Minimum value must be less than maximum value");
+        // Input validation (allow min == max, but not min > max unless max is infinity)
+        if (min > max && max != Double.POSITIVE_INFINITY && min != Double.NEGATIVE_INFINITY) {
+            throw new IllegalArgumentException("Minimum value must be less than or equal to maximum value");
         }
-        String key = getParamKey(paramName);
+
+        String key = getParamKey(paramName); // Map display name to internal key
         for (FinParameter param : parameters) {
             if (param.name.equals(key)) {
-                // Determine the effective bounds by clamping user input against absolute limits
+                // Determine effective bounds based on absolute limits and user input
                 double effectiveMin, effectiveMax;
 
-                // Clamp minimum: Take the less restrictive of 0 or absoluteMin, then the more restrictive of that and user min.
-                double paramAbsoluteMin = "finCount".equals(param.name) ? 1.0 : 0.0; // Parameter-specific absolute minimums
-                effectiveMin = Math.max(paramAbsoluteMin, param.absoluteMin); // Start with physical/practical min
-                effectiveMin = Math.max(effectiveMin, min); // Apply user's min if it's more restrictive
+                // Start with absolute physical/practical limits
+                double paramAbsoluteMin = "finCount".equals(param.name) ? 1.0 : 0.0; // Default practical min
+                effectiveMin = Math.max(paramAbsoluteMin, param.absoluteMin);
+                effectiveMax = param.absoluteMax;
 
-                // Clamp maximum: Take the more restrictive of user max and absoluteMax
-                effectiveMax = max == Double.MAX_VALUE ? param.absoluteMax : Math.min(param.absoluteMax, max); // Apply user's max or absolute max
-
-                // Ensure effectiveMin is not greater than effectiveMax after clamping
-                if (effectiveMin > effectiveMax) {
-                     // This case might happen if user min > absolute max. Reset min to absolute max.
-                     effectiveMin = effectiveMax; 
+                // Apply user's min, respecting absolute min
+                if (min != Double.NEGATIVE_INFINITY) {
+                    effectiveMin = Math.max(effectiveMin, min);
                 }
 
+                // Apply user's max, respecting absolute max
+                if (max != Double.POSITIVE_INFINITY) {
+                    effectiveMax = Math.min(effectiveMax, max);
+                }
+
+                // Final check: ensure min is not greater than max after applying all constraints
+                if (effectiveMin > effectiveMax) {
+                    // This can happen if user's min > absolute max, or user's max < absolute min.
+                    // A reasonable approach is to set both to the midpoint or one of the limits.
+                    // Setting both to the absolute limit that was violated seems logical.
+                    if (min > param.absoluteMax) { // User min violated absolute max
+                         effectiveMin = effectiveMax = param.absoluteMax;
+                    } else if (max < param.absoluteMin) { // User max violated absolute min
+                         effectiveMin = effectiveMax = param.absoluteMin;
+                    } else { // Default fallback: clamp min to max
+                     effectiveMin = effectiveMax; 
+                    }
+                    log(String.format("Warning: Bounds conflict for %s. Clamped range to [%.2f, %.2f]",
+                                       paramName, effectiveMin, effectiveMax));
+                }
+
+                // Update the parameter's current bounds used for clamping in objective function
                 param.currentMin = effectiveMin;
                 param.currentMax = effectiveMax;
-                param.hasMaxLimit = (effectiveMax != Double.MAX_VALUE && effectiveMax < Double.POSITIVE_INFINITY); // Check if there's a finite upper bound
+                // hasMaxLimit is less critical now as clamping handles it, but keep updated
+                param.hasMaxLimit = (param.currentMax != Double.POSITIVE_INFINITY && param.currentMax != Double.MAX_VALUE);
 
-                // Adjust step based on the *effective* range
-                if (effectiveMin == Double.NEGATIVE_INFINITY && effectiveMax == Double.POSITIVE_INFINITY) {
-                    param.step = 1.0; // Both unlimited
-                } else if (effectiveMin == Double.NEGATIVE_INFINITY) {
-                    param.step = Math.max(Math.abs(effectiveMax) * 0.1, 0.01); // Min unlimited
-                } else if (!param.hasMaxLimit || effectiveMax == Double.POSITIVE_INFINITY) {
-                    param.step = Math.max(Math.abs(effectiveMin) * 0.1, 0.01); // Max unlimited
-                } else if (Math.abs(effectiveMax - effectiveMin) < 1e-6) {
-                    param.step = 0; // No range to step over
-                } else {
-                    param.step = Math.max((effectiveMax - effectiveMin) / 10.0, 0.01); // Finite range
-                }
-                
-                // Special step handling for finCount
+                // Recalculate step size based on the *effective* range (used for initial simplex generation? Less critical now)
+                 if (Math.abs(effectiveMax - effectiveMin) < 1e-9) {
+                     param.step = 0;
+                 } else if (effectiveMin == Double.NEGATIVE_INFINITY || effectiveMax == Double.POSITIVE_INFINITY || !param.hasMaxLimit) {
+                     // Use a default step or percentage of the single bound if one exists
+                     param.step = Math.max(Math.abs(effectiveMin != Double.NEGATIVE_INFINITY ? effectiveMin : effectiveMax) * 0.1, 0.1);
+                 }
+                 else {
+                     param.step = Math.max((effectiveMax - effectiveMin) / 10.0, 0.01); // 10 steps across range
+                 }
+
+
+                // Special handling for finCount (ensure integer bounds and step)
                 if ("finCount".equals(param.name)) {
-                    param.step = Math.max(1.0, param.step); // Fin count step must be at least 1
-                    param.currentMin = Math.ceil(param.currentMin); // Ensure integer min
-                    param.currentMax = Math.floor(param.currentMax); // Ensure integer max
-                    // Recalculate effectiveMin/Max after ceiling/flooring for finCount
+                    param.currentMin = Math.ceil(param.currentMin);
+                    param.currentMax = Math.floor(param.currentMax);
+                     // Ensure range is still valid after floor/ceil
+                     if (param.currentMin > param.currentMax) {
+                         param.currentMin = param.currentMax; // Set min to max if range inverted
+                     }
+                     param.step = Math.max(1.0, Math.round(param.step)); // Ensure integer step >= 1
+                     // Update effectiveMin/Max after ceiling/flooring
                     effectiveMin = param.currentMin; 
                     effectiveMax = param.currentMax;
-                    if (effectiveMin > effectiveMax) { // Handle case where floor/ceil makes range invalid
-                        effectiveMin = effectiveMax;
-                        param.currentMin = effectiveMin;
-                    }
                 }
-                
-                log(String.format("Updated bounds for %s: Effective Min=%.2f, Effective Max=%.2f, Step=%.2f", 
-                                  paramName, effectiveMin, effectiveMax == Double.MAX_VALUE ? Double.POSITIVE_INFINITY : effectiveMax, param.step));
 
+                log(String.format("Updated bounds for %s: Effective Range=[%.2f, %.2f], Step=%.2f",
+                                  paramName, effectiveMin,
+                                  (effectiveMax == Double.POSITIVE_INFINITY ? Double.POSITIVE_INFINITY : effectiveMax), // Avoid printing MAX_VALUE
+                                  param.step));
                 break;
             }
         }
@@ -1222,34 +1234,50 @@ public class Optimizer {
     public void cancel() {
         this.cancelled = true;
         log("Optimization cancelled by user");
+        // Revert components to their state *before* optimization started
         revertToOriginalValues();
+        // Apply original parachute settings as well
+        applyCurrentParachuteSettings(); // Since currentStageXParachute was reset in revert
+         // Clear any potentially incomplete best values
+         bestValues.clear();
+         bestError = Double.MAX_VALUE;
     }
     
     /**
      * Reverts all parameters to their original values
      */
     public void revertToOriginalValues() {
+        log("Reverting parameters to original values...");
+        // Revert numeric parameters in the model
         for (FinParameter param : parameters) {
-            param.currentValue = originalValues.get(param.name);
-            param.currentMin = originalValues.get(param.name);
-            param.currentMax = originalValues.get(param.name);
-            param.step = 0;
+            if (originalValues.containsKey(param.name)) {
+                double rawValue = originalValues.get(param.name);
+                 param.currentValue = rawValue; // Reset transient value
+                 // Also reset currentMin/Max used for clamping back to original derived bounds?
+                 // Or keep the user-set bounds? Keeping user bounds seems less surprising.
+
+                double convertedValue = param.converter.apply(rawValue);
+                try {
+                    switch (param.name) {
+                        case "thickness": fins.setThickness(convertedValue); break;
+                        case "rootChord": fins.setLength(convertedValue); break;
+                        case "height": fins.setHeight(convertedValue); break;
+                        case "finCount": fins.setFinCount((int) Math.round(rawValue)); break;
+                        case "noseLength": noseCone.setLength(convertedValue); break;
+                        case "noseWallThickness": noseCone.setThickness(convertedValue); break;
+                    }
+                } catch (Exception e) {
+                     log("Error reverting " + param.name + ": " + e.getMessage());
+                 }
+            }
         }
-        
-        // Revert parachutes to original settings
-        if (stage1Parachute != null) {
-            currentStage1Parachute = bestStage1Parachute;
-            ParachuteHelper.applyPreset(stage1Parachute, originalStage1Preset);
-        }
-        
-        if (stage2Parachute != null) {
-            currentStage2Parachute = bestStage2Parachute;
-            ParachuteHelper.applyPreset(stage2Parachute, originalStage2Preset);
-        }
-        
-        // Clear best values since we're reverting
-        bestValues.clear();
-        bestError = Double.MAX_VALUE;
+
+        // Reset current parachute selections to originals
+        currentStage1Parachute = (originalStage1Preset != null) ? ParachuteHelper.getPresetDisplayName(originalStage1Preset) : "None";
+        currentStage2Parachute = (originalStage2Preset != null) ? ParachuteHelper.getPresetDisplayName(originalStage2Preset) : "None";
+        // Note: applyCurrentParachuteSettings() needs to be called *after* this by the caller (e.g., cancel())
+
+        // Don't clear bestValues here, cancel() handles that.
     }
     
     private void log(String message) {
@@ -1281,39 +1309,10 @@ public class Optimizer {
         return bestStage2Parachute;
     }
 
+    // Now returns original values in CM / count
     public Map<String, Double> getInitialValues() {
-        Map<String, Double> values = new HashMap<>();
-        values.put("thickness", originalValues.get("thickness"));
-        values.put("rootChord", originalValues.get("rootChord"));
-        values.put("height", originalValues.get("height"));
-        values.put("finCount", originalValues.get("finCount"));
-        values.put("noseLength", originalValues.get("noseLength"));
-        values.put("noseWallThickness", originalValues.get("noseWallThickness"));
-        // Return 0.0/1.0 for parachute presence, but don't store in 'bestValues' format
-        // values.put("stage1Parachute", currentStage1Parachute.equals("None") ? 0.0 : 1.0); // No longer needed here
-        // values.put("stage2Parachute", currentStage2Parachute.equals("None") ? 0.0 : 1.0); // No longer needed here
-        
-        // --- REMOVED --- Do NOT run simulation here for initial values ---
-        /*
-        try {
-            SimulationStepper.SimulationResult result = new SimulationStepper(rocket, baseOptions).runSimulation();
-            values.put("apogee", result.altitude);
-            values.put("duration", result.duration);
-            values.put("altitudeScore", calculateAltitudeScore(result.altitude, config.altitudeRange[0], config.altitudeRange[1]));
-            values.put("durationScore", calculateDurationScore(result.duration, config.durationRange[0], config.durationRange[1]));
-            values.put("totalScore", values.get("altitudeScore") + values.get("durationScore"));
-        } catch (Exception e) {
-            // If simulation fails, set default values
-            values.put("apogee", 0.0);
-            values.put("duration", 0.0);
-            values.put("altitudeScore", 0.0);
-            values.put("durationScore", 0.0);
-            values.put("totalScore", 0.0);
-        }
-        */
-        // --- END REMOVED ---
-        
-        return values;
+        // Return a copy of the originalValues map which now stores raw values (cm/count)
+        return new HashMap<>(originalValues);
     }
 
     // Find the first parachute in the rocket

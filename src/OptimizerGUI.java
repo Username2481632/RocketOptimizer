@@ -932,18 +932,8 @@ public class OptimizerGUI extends JFrame {
                 if (initialValues.containsKey(key)) {
                     Double value = initialValues.get(key);
                     String format = getFormatForParameter(paramName);
-                    double displayValue = (value != null) ? value : 0.0; // Default to 0 if null
+                    double displayValue = (value != null) ? value : 0.0; 
 
-                    // Convert meters to cm for display where applicable
-                    if (value != null && (
-                        "Fin Thickness (cm)".equals(paramName) ||
-                        "Root Chord (cm)".equals(paramName) ||
-                        "Fin Height (cm)".equals(paramName) ||
-                        "Nose Cone Length (cm)".equals(paramName) ||
-                        "Nose Cone Wall Thickness (cm)".equals(paramName))) {
-                       displayValue = value * 100.0;
-                    }
-                    
                     // Handle special cases for parachutes
                     if ("Stage 1 Parachute".equals(paramName)) {
                         String p1Name = tempOptimizer.getBestStage1Parachute();
