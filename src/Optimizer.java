@@ -1289,10 +1289,12 @@ public class Optimizer {
         values.put("finCount", originalValues.get("finCount"));
         values.put("noseLength", originalValues.get("noseLength"));
         values.put("noseWallThickness", originalValues.get("noseWallThickness"));
-        values.put("stage1Parachute", currentStage1Parachute.equals("None") ? 0.0 : 1.0);
-        values.put("stage2Parachute", currentStage2Parachute.equals("None") ? 0.0 : 1.0);
+        // Return 0.0/1.0 for parachute presence, but don't store in 'bestValues' format
+        // values.put("stage1Parachute", currentStage1Parachute.equals("None") ? 0.0 : 1.0); // No longer needed here
+        // values.put("stage2Parachute", currentStage2Parachute.equals("None") ? 0.0 : 1.0); // No longer needed here
         
-        // Add initial simulation results if available
+        // --- REMOVED --- Do NOT run simulation here for initial values ---
+        /*
         try {
             SimulationStepper.SimulationResult result = new SimulationStepper(rocket, baseOptions).runSimulation();
             values.put("apogee", result.altitude);
@@ -1308,6 +1310,8 @@ public class Optimizer {
             values.put("durationScore", 0.0);
             values.put("totalScore", 0.0);
         }
+        */
+        // --- END REMOVED ---
         
         return values;
     }

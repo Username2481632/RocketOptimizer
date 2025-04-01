@@ -932,35 +932,79 @@ public class OptimizerGUI extends JFrame {
                 if (initialValues.containsKey(key)) {
                     Double value = initialValues.get(key);
                     String format = getFormatForParameter(paramName);
+                    double displayValue = (value != null) ? value : 0.0; // Default to 0 if null
+
+                    // Convert meters to cm for display where applicable
+                    if (value != null && (
+                        "Fin Thickness (cm)".equals(paramName) ||
+                        "Root Chord (cm)".equals(paramName) ||
+                        "Fin Height (cm)".equals(paramName) ||
+                        "Nose Cone Length (cm)".equals(paramName) ||
+                        "Nose Cone Wall Thickness (cm)".equals(paramName))) {
+                       displayValue = value * 100.0;
+                    }
                     
                     // Handle special cases for parachutes
                     if ("Stage 1 Parachute".equals(paramName)) {
-                        tableModel.setValueAt(tempOptimizer.getBestStage1Parachute(), row, 2);
+                        String p1Name = tempOptimizer.getBestStage1Parachute();
+                        tableModel.setValueAt(p1Name != null ? p1Name : "", row, 2); // Show empty if null
                         stage1ParachuteRow = row;
                     } else if ("Stage 2 Parachute".equals(paramName)) {
-                        tableModel.setValueAt(tempOptimizer.getBestStage2Parachute(), row, 2);
+                        String p2Name = tempOptimizer.getBestStage2Parachute();
+                        tableModel.setValueAt(p2Name != null ? p2Name : "", row, 2); // Show empty if null
                         stage2ParachuteRow = row;
                     } else {
-                        tableModel.setValueAt(String.format(format, value), row, 2);
+                        // Use displayValue which might have been converted
+                        tableModel.setValueAt(String.format(format, displayValue), row, 2);
                     }
                 }
             }
             
+            // --- REMOVED --- Score labels are no longer updated here, as getInitialValues doesn't run a simulation ---
+            /*
             // Update score labels
             if (initialValues.containsKey("altitudeScore")) {
                 apogeeScoreLabel.setText(String.format("%.1f", initialValues.get("altitudeScore")));
+            } else {
+                apogeeScoreLabel.setText("--"); // Handle case where score is missing
             }
             if (initialValues.containsKey("durationScore")) {
                 durationScoreLabel.setText(String.format("%.2f", initialValues.get("durationScore")));
+            } else {
+                durationScoreLabel.setText("--"); // Handle case where score is missing
             }
             if (initialValues.containsKey("totalScore")) {
                 totalScoreLabel.setText(String.format("%.2f", initialValues.get("totalScore")));
+            } else {
+                totalScoreLabel.setText("--"); // Handle case where score is missing
             }
+            */
+            // --- END REMOVED ---
             
         } catch (Exception e) {
-            // Ignore errors when loading initial values
-            // The file might not be valid or might not exist yet
+            // Show error message if loading initial values fails
+             JOptionPane.showMessageDialog(this,
+                    "Failed to load initial values from ORK file:\n" + e.getMessage(),
+                    "Initialization Error",
+                    JOptionPane.WARNING_MESSAGE);
+             // Clear potentially incorrect values shown before error
+             clearValueColumn();
+             clearScoreLabels();
         }
+    }
+
+    // Helper method to clear the value column
+    private void clearValueColumn() {
+        for (int row = 0; row < tableModel.getRowCount(); row++) {
+            tableModel.setValueAt("", row, 2);
+        }
+    }
+    
+    // Helper method to clear score labels
+    private void clearScoreLabels() {
+        apogeeScoreLabel.setText("--");
+        durationScoreLabel.setText("--");
+        totalScoreLabel.setText("--");
     }
 
     private class BrowseAction implements ActionListener {
