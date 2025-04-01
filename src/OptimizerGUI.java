@@ -632,8 +632,8 @@ public class OptimizerGUI extends JFrame {
         try (InputStream in = new FileInputStream(CONFIG_FILE)) {
             props.load(in);
             filePathField.setText(props.getProperty("orkPath", ""));
-            stabilityMinField.setText(props.getProperty("stabilityMin", "1.0"));
-            stabilityMaxField.setText(props.getProperty("stabilityMax", "2.0"));
+            stabilityMinField.setText(props.getProperty("stabilityMin", ""));
+            stabilityMaxField.setText(props.getProperty("stabilityMax", ""));
             
             // Load parameter bounds and enabled status into the table
             for (int row = 0; row < tableModel.getRowCount(); row++) {
@@ -977,6 +977,41 @@ public class OptimizerGUI extends JFrame {
         }
     }
 
+    /**
+     * Maps GUI display names to the keys expected by the Optimizer's enabledParams map.
+     * For FinParameter items, it uses the internal key (e.g., "thickness").
+     * For others (Scores, Parachutes), it uses the display name.
+     */
+    private String getOptimizerParamKey(String displayName) {
+        if (displayName.startsWith("Fin Thickness")) return "thickness";
+        if (displayName.startsWith("Root Chord")) return "rootChord";
+        if (displayName.startsWith("Fin Height")) return "height";
+        if (displayName.startsWith("Number of Fins")) return "finCount";
+        if (displayName.startsWith("Nose Cone Length")) return "noseLength";
+        if (displayName.startsWith("Nose Cone Wall Thickness")) return "noseWallThickness";
+        // Handle specific GUI names just in case
+        switch (displayName) {
+            case "Fin Thickness (cm)": return "thickness";
+            case "Root Chord (cm)": return "rootChord";
+            case "Fin Height (cm)": return "height";
+            case "Nose Cone Length (cm)": return "noseLength";
+            case "Nose Cone Wall Thickness (cm)": return "noseWallThickness";
+            // For non-FinParameter items, use the display name as the key
+            case "Apogee":
+            case "Duration":
+            case "Stage 1 Parachute":
+            case "Stage 2 Parachute":
+            case "Altitude Score": 
+            case "Duration Score": 
+            case "Total Score": // Include Total Score if needed elsewhere
+                return displayName; 
+            default: 
+                // Fallback, should ideally not be reached for known params
+                System.err.println("Warning: Unknown parameter display name encountered: " + displayName);
+                return displayName.toLowerCase().replace(" ", ""); 
+        }
+    }
+
     private class StartOptimizationAction implements ActionListener {
         @Override
         public void actionPerformed(ActionEvent e) {
@@ -991,160 +1026,293 @@ public class OptimizerGUI extends JFrame {
                 stabilityMin = Double.parseDouble(stabilityMinField.getText());
                 stabilityMax = Double.parseDouble(stabilityMaxField.getText());
                 if (stabilityMin >= stabilityMax) {
-                    throw new IllegalArgumentException();
+                    throw new IllegalArgumentException("Stability min must be less than stability max.");
                 }
-            } catch (Exception ex) {
-                JOptionPane.showMessageDialog(OptimizerGUI.this, "Invalid stability range.", "Error", JOptionPane.ERROR_MESSAGE);
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(OptimizerGUI.this, "Invalid stability range format.", "Error", JOptionPane.ERROR_MESSAGE);
                 return;
+            } catch (IllegalArgumentException ex) {
+                 JOptionPane.showMessageDialog(OptimizerGUI.this, ex.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+                 return;
             }
 
-            // Validate parameter bounds
-            StringBuilder errors = new StringBuilder();
+
+            // --- Pre-validation and Clamping ---
+            StringBuilder validationErrors = new StringBuilder();
+            StringBuilder clampingWarnings = new StringBuilder();
+            Optimizer tempOptimizer = null;
+
+            try {
+                tempOptimizer = new Optimizer();
+                tempOptimizer.getConfig().orkPath = orkPath;
+                // Temporarily set stability range for initialization if needed by physical bounds calculation
+                tempOptimizer.getConfig().stabilityRange = new double[]{stabilityMin, stabilityMax}; 
+                tempOptimizer.initialize(); // This calculates physical bounds
+            } catch (Exception ex) {
+                JOptionPane.showMessageDialog(OptimizerGUI.this,
+                        "Error reading ORK file for validation: " + ex.getMessage(),
+                        "Initialization Error", JOptionPane.ERROR_MESSAGE);
+                return; // Cannot proceed without physical bounds
+            }
+
+            // Validate parameter bounds and clamp if necessary
             for (int row = 0; row < tableModel.getRowCount(); row++) {
                 String paramName = (String) tableModel.getValueAt(row, 1);
                 Boolean enabled = (Boolean) tableModel.getValueAt(row, 0);
-                if (!enabled) continue;
 
-                String minStr = tableModel.getValueAt(row, 3) != null ? tableModel.getValueAt(row, 3).toString() : "";
-                String maxStr = tableModel.getValueAt(row, 4) != null ? tableModel.getValueAt(row, 4).toString() : "";
+                // Skip disabled parameters and non-optimizable rows (Apogee, Duration, Parachutes for this check)
+                if (!enabled || paramName.contains("Parachute") || "Apogee".equals(paramName) || "Duration".equals(paramName)) {
+                    continue;
+                }
 
-                // Check for invalid number format
+                Object minObj = tableModel.getValueAt(row, 3);
+                Object maxObj = tableModel.getValueAt(row, 4);
+                String minStr = (minObj != null) ? minObj.toString() : "";
+                String maxStr = (maxObj != null) ? maxObj.toString() : "";
+
+                Optimizer.FinParameter finParam = tempOptimizer.getFinParameter(paramName);
+                if (finParam == null) {
+                    validationErrors.append("\nInternal error: Could not find parameter details for ").append(paramName);
+                    continue; // Should not happen
+                }
+
+                double userMin = Double.NEGATIVE_INFINITY;
+                double userMax = Double.POSITIVE_INFINITY; // Use POSITIVE_INFINITY for unlimited max
+
                 try {
-                    double min;
-                    if (minStr.isEmpty()) {
-                        // Use negative infinity for empty minimum values
-                        min = Double.NEGATIVE_INFINITY;
+                    if (!minStr.isEmpty()) {
+                        if ("Number of Fins".equals(paramName)) {
+                            userMin = Integer.parseInt(minStr);
+                        } else {
+                            userMin = Double.parseDouble(minStr);
+                        }
+                    }
+
+                    if (!maxStr.isEmpty()) {
+                         if ("Number of Fins".equals(paramName)) {
+                            userMax = Integer.parseInt(maxStr);
+                        } else {
+                            userMax = Double.parseDouble(maxStr);
+                        }
                     } else {
-                        min = Double.parseDouble(minStr);
+                        // If max string is empty, it means unlimited
+                        userMax = Double.POSITIVE_INFINITY; 
                     }
                     
-                    // If max is specified, validate it
-                    if (!maxStr.isEmpty()) {
-                        double max = Double.parseDouble(maxStr);
+                    // Basic validation: min <= max
+                    if (userMin > userMax) {
+                         if (validationErrors.length() > 0) validationErrors.append("\n");
+                         validationErrors.append("Minimum value cannot be greater than maximum value for: ").append(paramName);
+                         continue; // Skip clamping checks if basic validation fails
+                    }
 
-                        // Check for min > max
-                        if (min > max) {
-                            if (errors.length() > 0) errors.append("\n");
-                            errors.append("Minimum value cannot be greater than maximum value for: ").append(paramName);
-                            continue;
+                    // Get physical bounds from the temporary optimizer
+                    double physicalMin = finParam.absoluteMin;
+                    double physicalMax = finParam.absoluteMax;
+                    
+                    double clampedMin = userMin;
+                    double clampedMax = userMax;
+                    boolean minClamped = false;
+                    boolean maxClamped = false;
+
+                    // Check and clamp Minimum
+                    if (userMin < physicalMin) {
+                        clampedMin = physicalMin;
+                        minClamped = true;
+                        // Only warn if the user actually *entered* a specific value below the physical minimum
+                        if (!minStr.isEmpty()) { // i.e., userMin was not originally Double.NEGATIVE_INFINITY
+                             if (clampingWarnings.length() > 0) clampingWarnings.append("\n");
+                             clampingWarnings.append(String.format("%s minimum clamped to physical limit %.2f", paramName, physicalMin));
                         }
                     }
 
-                    // Check for non-integer values in Number of Fins
+                    // Check and clamp Maximum
+                    // Only clamp if physicalMax has a finite limit (is not MAX_VALUE or POSITIVE_INFINITY)
+                    if (physicalMax != Double.MAX_VALUE && physicalMax != Double.POSITIVE_INFINITY && userMax > physicalMax) {
+                        clampedMax = physicalMax;
+                        maxClamped = true;
+                         // Only warn if the user actually *entered* a specific value above the physical maximum
+                        if (!maxStr.isEmpty()) { // i.e., userMax was not originally Double.POSITIVE_INFINITY
+                            if (clampingWarnings.length() > 0) clampingWarnings.append("\n");
+                            clampingWarnings.append(String.format("%s maximum clamped to physical limit %.2f", paramName, physicalMax));
+                        }
+                    }
+                    
+                    // Ensure clampedMin is not > clampedMax after potential clamping
+                    if (clampedMin > clampedMax) {
+                       // This should ideally not happen if physicalMin <= physicalMax, but as a safeguard:
+                       clampedMin = clampedMax; 
+                       // No need to mark as clamped here, the individual checks handle warnings
+                    }
+
+                    // --- DO NOT Update the table model visually for clamping --- 
+                    // The GUI will continue to show the user's original input.
+
+                    // Check for non-integer values in Number of Fins using clamped values
                     if ("Number of Fins".equals(paramName)) {
-                        if ((!minStr.isEmpty() && min != Math.floor(min)) || 
-                            (!maxStr.isEmpty() && Double.parseDouble(maxStr) != Math.floor(Double.parseDouble(maxStr)))) {
-                            if (errors.length() > 0) errors.append("\n");
-                            errors.append("Number of Fins must be an integer value (no decimals allowed)");
+                        if ((!minStr.isEmpty() && clampedMin != Math.floor(clampedMin)) ||
+                            (!maxStr.isEmpty() && clampedMax != Double.POSITIVE_INFINITY && clampedMax != Math.floor(clampedMax))) {
+                            if (validationErrors.length() > 0) validationErrors.append("\n");
+                            validationErrors.append("Number of Fins must be an integer value (no decimals allowed)");
                         }
                     }
+
                 } catch (NumberFormatException ex) {
-                    if (errors.length() > 0) errors.append("\n");
-                    errors.append("Invalid number format for: ").append(paramName);
+                    if (validationErrors.length() > 0) validationErrors.append("\n");
+                    validationErrors.append("Invalid number format for: ").append(paramName);
                 }
-            }
-            
-            // Pre-validate the parachute components
-            try {
-                Optimizer testOptimizer = new Optimizer();
-                testOptimizer.getConfig().orkPath = orkPath;
-                testOptimizer.initialize();
-                
-                // Validate stage 1 parachute
-                if (stage1ParachuteRow >= 0) {
-                    boolean enabled = (Boolean) tableModel.getValueAt(stage1ParachuteRow, 0);
-                    if (enabled && !testOptimizer.hasStage1Parachute()) {
-                        if (errors.length() > 0) errors.append("\n");
-                        errors.append("Stage 1 Parachute component not found in the provided ORK file.");
-                    }
-                }
-                
-                // Validate stage 2 parachute
-                if (stage2ParachuteRow >= 0) {
-                    boolean enabled = (Boolean) tableModel.getValueAt(stage2ParachuteRow, 0);
-                    if (enabled && !testOptimizer.hasStage2Parachute()) {
-                        if (errors.length() > 0) errors.append("\n");
-                        errors.append("Stage 2 Parachute component not found in the provided ORK file.");
-                    }
-                }
-            } catch (Exception ex) {
-                if (errors.length() > 0) errors.append("\n");
-                errors.append("Error validating components: ").append(ex.getMessage());
             }
 
-            if (errors.length() > 0) {
+            // Validate parachute components existence
+             try {
+                 // Use the already initialized tempOptimizer
+                 if (stage1ParachuteRow >= 0) {
+                     boolean enabled = (Boolean) tableModel.getValueAt(stage1ParachuteRow, 0);
+                     if (enabled && !tempOptimizer.hasStage1Parachute()) {
+                         if (validationErrors.length() > 0) validationErrors.append("\n");
+                         validationErrors.append("Stage 1 Parachute component not found in the provided ORK file.");
+                     }
+                 }
+                 if (stage2ParachuteRow >= 0) {
+                     boolean enabled = (Boolean) tableModel.getValueAt(stage2ParachuteRow, 0);
+                     if (enabled && !tempOptimizer.hasStage2Parachute()) {
+                         if (validationErrors.length() > 0) validationErrors.append("\n");
+                         validationErrors.append("Stage 2 Parachute component not found in the provided ORK file.");
+                     }
+                 }
+             } catch (Exception ex) {
+                 // Catch potential issues during hasStageXParachute calls
+                 if (validationErrors.length() > 0) validationErrors.append("\n");
+                 validationErrors.append("Error validating parachute components: ").append(ex.getMessage());
+             }
+             
+            // --- Show Errors or Warnings ---
+            if (validationErrors.length() > 0) {
                 JOptionPane.showMessageDialog(OptimizerGUI.this,
-                    "Please fix the following errors before starting optimization:\n" + errors,
-                    "Validation Errors",
-                    JOptionPane.ERROR_MESSAGE);
-                return;
+                        "Please fix the following errors before starting optimization:\n" + validationErrors.toString(),
+                        "Validation Errors",
+                        JOptionPane.ERROR_MESSAGE);
+                return; // Stop if there are fatal errors
             }
 
+            if (clampingWarnings.length() > 0) {
+                JOptionPane.showMessageDialog(OptimizerGUI.this,
+                        "The following bounds were adjusted to physical limits:\n" + clampingWarnings.toString() +
+                        "\n\nOptimization will proceed with the adjusted values.",
+                        "Bounds Clamped",
+                        JOptionPane.WARNING_MESSAGE);
+                // Continue after warning
+            }
+
+            // --- Proceed with Optimization Setup ---
             startButton.setEnabled(false);
             cancelButton.setEnabled(true);
             saveInPlaceButton.setEnabled(false);
             saveAsButton.setEnabled(false);
             progressBar.setValue(0);
 
-            optimizer = new Optimizer();
+            optimizer = new Optimizer(); // Create the real optimizer instance
             optimizer.getConfig().orkPath = orkPath;
             optimizer.getConfig().stabilityRange = new double[]{stabilityMin, stabilityMax};
-            
-            // Create a new map for enabled parameters
-            Map<String, Boolean> enabledParamsMap = new HashMap<>();
-            for (int row = 0; row < tableModel.getRowCount(); row++) {
-                String displayName = (String) tableModel.getValueAt(row, 1);
-                Boolean enabled = (Boolean) tableModel.getValueAt(row, 0);
-                
-                // Map GUI display names to optimizer parameter names, but preserve parachute names
-                String optimizerParamName;
-                if (displayName.contains("Parachute")) {
-                    // Keep parachute names intact to distinguish between stages
-                    optimizerParamName = displayName;
-                } else {
-                    // For other parameters, normalize as before
-                    optimizerParamName = displayName.replace(" (cm)", "");  // Remove unit specifiers
-                }
-                
-                enabledParamsMap.put(optimizerParamName, enabled);
-            }
-            optimizer.getConfig().enabledParams = enabledParamsMap;
 
-            // Set parameter bounds from table
+            // Set range for altitude and duration from the table (these are not clamped)
             for (int row = 0; row < tableModel.getRowCount(); row++) {
                 String paramName = (String) tableModel.getValueAt(row, 1);
                 Object minObj = tableModel.getValueAt(row, 3);
                 Object maxObj = tableModel.getValueAt(row, 4);
-                
-                // Skip parachute rows
-                if ("Stage 1 Parachute".equals(paramName) || "Stage 2 Parachute".equals(paramName)) {
-                    continue;
-                }
-                
+                double minVal, maxVal;
+
                 try {
-                    double min;
-                    double max;
+                     minVal = (minObj != null && !minObj.toString().isEmpty()) 
+                         ? Double.parseDouble(minObj.toString()) 
+                         : Double.NEGATIVE_INFINITY;
                     
-                    if (minObj == null || minObj.toString().isEmpty()) {
-                        // Use negative infinity for empty minimum value
-                        min = Double.NEGATIVE_INFINITY;
-                    } else {
-                        min = Double.parseDouble(minObj.toString());
+                     maxVal = (maxObj != null && !maxObj.toString().isEmpty()) 
+                         ? Double.parseDouble(maxObj.toString()) 
+                         : Double.POSITIVE_INFINITY; // Use POSITIVE_INFINITY for unlimited
+
+                    if ("Apogee".equals(paramName)) {
+                        optimizer.getConfig().altitudeRange[0] = minVal;
+                        optimizer.getConfig().altitudeRange[1] = maxVal;
+                    } else if ("Duration".equals(paramName)) {
+                        optimizer.getConfig().durationRange[0] = minVal;
+                        optimizer.getConfig().durationRange[1] = maxVal;
                     }
-                    
-                    if (maxObj == null || maxObj.toString().isEmpty()) {
-                        // Use a default high value to represent "unlimited"
-                        max = Double.MAX_VALUE;
-                    } else {
-                        max = Double.parseDouble(maxObj.toString());
-                    }
-                    
-                    optimizer.updateParameterBounds(paramName, min, max);
                 } catch (NumberFormatException ex) {
-                    // Skip invalid values
+                     // Handle cases where Apogee/Duration bounds might be invalid, though ideally caught earlier
+                     JOptionPane.showMessageDialog(OptimizerGUI.this, 
+                         "Invalid number format for bounds of " + paramName, "Error", JOptionPane.ERROR_MESSAGE);
+                     startButton.setEnabled(true); // Re-enable start button
+                     cancelButton.setEnabled(false);
+                     return;
                 }
             }
 
+            // Set enabled parameters map
+            Map<String, Boolean> enabledParamsMap = new HashMap<>();
+            for (int row = 0; row < tableModel.getRowCount(); row++) {
+                String displayName = (String) tableModel.getValueAt(row, 1);
+                Boolean enabled = (Boolean) tableModel.getValueAt(row, 0);
+                // Use the mapping function to get the correct key for the optimizer config
+                String optimizerKey = getOptimizerParamKey(displayName);
+                enabledParamsMap.put(optimizerKey, enabled); 
+            }
+            optimizer.getConfig().enabledParams = enabledParamsMap;
+
+            // Set parameter bounds for the real optimizer using values from the (potentially updated) table
+            for (int row = 0; row < tableModel.getRowCount(); row++) {
+                String paramName = (String) tableModel.getValueAt(row, 1);
+                Boolean enabled = (Boolean) tableModel.getValueAt(row, 0);
+
+                // Skip non-optimizable parameters and disabled ones
+                 if (!enabled || paramName.contains("Parachute") || "Apogee".equals(paramName) || "Duration".equals(paramName)) {
+                    continue;
+                }
+
+                Object minObj = tableModel.getValueAt(row, 3);
+                Object maxObj = tableModel.getValueAt(row, 4);
+                
+                try {
+                    double minFromTable;
+                    double maxFromTable;
+
+                    if (minObj == null || minObj.toString().isEmpty()) {
+                        minFromTable = Double.NEGATIVE_INFINITY; // No minimum limit
+                    } else {
+                         if ("Number of Fins".equals(paramName)) {
+                             minFromTable = Integer.parseInt(minObj.toString());
+                         } else {
+                             minFromTable = Double.parseDouble(minObj.toString());
+                         }
+                    }
+                    
+                    if (maxObj == null || maxObj.toString().isEmpty()) {
+                        maxFromTable = Double.POSITIVE_INFINITY; // Represent unlimited max
+                    } else {
+                         if ("Number of Fins".equals(paramName)) {
+                            maxFromTable = Integer.parseInt(maxObj.toString());
+                         } else {
+                            maxFromTable = Double.parseDouble(maxObj.toString());
+                         }
+                    }
+                    
+                    // Pass the values read directly from the table (which were not modified by clamping)
+                    // The updateParameterBounds method in Optimizer will handle the final clamping logic.
+                    optimizer.updateParameterBounds(paramName, minFromTable, maxFromTable);
+
+                } catch (NumberFormatException ex) {
+                    // This shouldn't happen if validation passed, but handle defensively
+                    JOptionPane.showMessageDialog(OptimizerGUI.this,
+                            "Internal error setting bounds for " + paramName + ": " + ex.getMessage(),
+                            "Error",
+                            JOptionPane.ERROR_MESSAGE);
+                    startButton.setEnabled(true);
+                    cancelButton.setEnabled(false);
+                    return;
+                }
+            }
+
+            // --- Start SwingWorker ---
             SwingWorker<Void, String> worker = new SwingWorker<>() {
                 @Override
                 protected Void doInBackground() {

@@ -59,23 +59,27 @@ public class Optimizer {
     private String bestStage2Parachute = "None";
 
     public Optimizer() {
-        parameters.add(new FinParameter("thickness", 0.1, 0.5, 0.05, v -> v / 100));
-        parameters.add(new FinParameter("rootChord", 7.0, 15.0, 1.0, v -> v / 100));
-        parameters.add(new FinParameter("height", 3.0, 10.0, 1.0, v -> v / 100));
-        parameters.add(new FinParameter("finCount", 3, 8, 1.0, v -> v));
-        parameters.add(new FinParameter("noseLength", 5.0, 15.0, 1.0, v -> v / 100));
-        parameters.add(new FinParameter("noseWallThickness", 0.1, 0.5, 0.05, v -> v / 100));
+        // Use derived minimums and Double.MAX_VALUE for maximums where no explicit limit exists
+        // Fin parameters units seem to be cm in the FinParameter constructor, converted later. Keep consistent for now.
+        parameters.add(new FinParameter("thickness", 0.0, Double.MAX_VALUE, 0.05, v -> v / 100)); // Min 0
+        parameters.add(new FinParameter("rootChord", 0.0, Double.MAX_VALUE, 1.0, v -> v / 100));  // Min 0
+        parameters.add(new FinParameter("height", 0.0, Double.MAX_VALUE, 1.0, v -> v / 100));     // Min 0
+        parameters.add(new FinParameter("finCount", 1.0, 8.0, 1.0, v -> v));                       // Min 1, Max 8
+        parameters.add(new FinParameter("noseLength", 0.0, Double.MAX_VALUE, 1.0, v -> v / 100)); // Min 0
+        // Practical max is nose base radius, but no hard upper limit in code. Use MAX_VALUE.
+        parameters.add(new FinParameter("noseWallThickness", 0.0, Double.MAX_VALUE, 0.05, v -> v / 100)); // Min 0
     }
 
     public static class OptimizationConfig {
-        public String orkPath = "rocket.ork";
-        public double targetApogee = 241.0;
-        public double[] stabilityRange = {1.0, 2.0};
-        public double[] durationRange = {41.0, 44.0};
+        public String orkPath = "rocket.ork"; // Keep default path? Or make null? Let's keep it for now.
+        public double[] altitudeRange = new double[2]; // Min and max altitude range
+        public double[] stabilityRange = new double[2]; // Remove default
+        public double[] durationRange = new double[2];  // Remove default
         public Map<String, Boolean> enabledParams = new HashMap<>();
     }
 
-    private static class FinParameter {
+    // Make FinParameter public and static so it can be accessed from OptimizerGUI
+    public static class FinParameter {
         final String name;
         double absoluteMin;
         double absoluteMax;
@@ -94,7 +98,7 @@ public class Optimizer {
             this.currentMax = absoluteMax;
             this.step = initialStep;
             this.converter = converter;
-            this.hasMaxLimit = true;
+            this.hasMaxLimit = (absoluteMax != Double.MAX_VALUE);
         }
     }
 
@@ -138,6 +142,42 @@ public class Optimizer {
             throw new RuntimeException("No nose cone found");
         }
         baseOptions = document.getSimulations().get(0).getOptions();
+
+        // --- Update dynamic bounds --- 
+        // Get Nose Cone Base Radius (in meters from OpenRocket)
+        double noseBaseRadiusMeters = noseCone.getBaseRadius();
+        // Max thickness is the radius (half the diameter). Convert to cm for the parameter.
+        double maxNoseThicknessCm = noseBaseRadiusMeters * 100; 
+        
+        // Find maximum fin dimensions based on body tube
+        double bodyTubeLengthCm = bodyTube.getLength() * 100; // Convert to cm
+        double bodyTubeRadiusCm = bodyTube.getOuterRadius() * 100; // Convert to cm
+        
+        // Update parameter bounds based on physical limitations
+        for (FinParameter param : parameters) {
+            if ("noseWallThickness".equals(param.name)) {
+                // Set the max bound, ensuring it doesn't exceed the previously set MAX_VALUE
+                param.absoluteMax = Math.min(param.absoluteMax, maxNoseThicknessCm);
+                param.currentMax = param.absoluteMax; // Initialize currentMax to the new absoluteMax
+                param.hasMaxLimit = (param.absoluteMax != Double.MAX_VALUE); // Update hasMaxLimit
+                log("Updated noseWallThickness max bound to: " + maxNoseThicknessCm + " cm");
+            } else if ("rootChord".equals(param.name)) {
+                // Root chord shouldn't exceed body tube length
+                param.absoluteMax = Math.min(param.absoluteMax, bodyTubeLengthCm);
+                param.currentMax = param.absoluteMax;
+                param.hasMaxLimit = (param.absoluteMax != Double.MAX_VALUE);
+                log("Updated rootChord max bound to: " + bodyTubeLengthCm + " cm");
+            } else if ("height".equals(param.name)) {
+                // Fin height (span) should have a reasonable upper limit based on body tube radius
+                // A practical maximum would be ~3x the body tube radius
+                double maxHeightCm = bodyTubeRadiusCm * 3;
+                param.absoluteMax = Math.min(param.absoluteMax, maxHeightCm);
+                param.currentMax = param.absoluteMax;
+                param.hasMaxLimit = (param.absoluteMax != Double.MAX_VALUE);
+                log("Updated fin height max bound to: " + maxHeightCm + " cm");
+            }
+        }
+        // --- End Update dynamic bounds --- 
 
         originalValues.put("thickness", fins.getThickness());
         originalValues.put("rootChord", fins.getLength());
@@ -212,11 +252,10 @@ public class Optimizer {
         }
 
         FinParameter param = parameters.get(paramIndex);
-        String displayName = getDisplayName(param.name);
-        boolean isEnabled = config.enabledParams.getOrDefault(displayName, true);
+        // Use the internal param.name as the key for the enabled check
+        boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
         
         if (!isEnabled) {
-            // If parameter is disabled, use the original value and continue to next parameter
             param.currentValue = originalValues.get(param.name);
             optimizeRecursive(paramIndex + 1);
             return;
@@ -224,8 +263,20 @@ public class Optimizer {
 
         // Handle special cases
         if (param.currentMin == Double.NEGATIVE_INFINITY && param.currentMax == Double.MAX_VALUE) {
-            // Both min and max are unlimited, try a reasonable set of values centered at 0
-            double[] valuesToTry = {-10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0};
+            // Special case for finCount - use only positive integers
+            if ("finCount".equals(param.name)) {
+                double[] valuesToTry = {1.0, 2.0, 3.0, 4.0, 6.0, 8.0};
+                for (double value : valuesToTry) {
+                    if (cancelled) return;
+                    param.currentValue = value;
+                    optimizeRecursive(paramIndex + 1);
+                }
+                return;
+            }
+            
+            // Both min and max are unlimited, try a reasonable set of values
+            // Use only non-negative values for dimension parameters
+            double[] valuesToTry = {0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0};
             for (double value : valuesToTry) {
                 if (cancelled) return;
                 param.currentValue = value;
@@ -233,25 +284,46 @@ public class Optimizer {
             }
             return;
         } else if (param.currentMin == Double.NEGATIVE_INFINITY) {
-            // Min is unlimited but max is not, try a few values below max
-            // and also include max itself
-            double maxVal = param.currentMax;
-            double[] valuesToTry = {maxVal - 16*param.step, maxVal - 8*param.step, 
-                                   maxVal - 4*param.step, maxVal - 2*param.step, maxVal};
-            for (double value : valuesToTry) {
-                if (cancelled) return;
-                param.currentValue = value;
-                optimizeRecursive(paramIndex + 1);
+            // Min is unlimited but max is not
+            if ("finCount".equals(param.name)) {
+                // For finCount, use integer values up to max
+                int maxVal = (int)Math.min(8, param.currentMax);
+                for (int i = 1; i <= maxVal && !cancelled; i++) {
+                    param.currentValue = i;
+                    optimizeRecursive(paramIndex + 1);
+                }
+                return;
+            } else {
+                // For non-finCount parameters, try a few values below max
+                // and also include max itself, ensuring non-negative values
+                double maxVal = param.currentMax;
+                double[] valuesToTry = {0.0, maxVal/16, maxVal/8, maxVal/4, maxVal/2, maxVal};
+                for (double value : valuesToTry) {
+                    if (cancelled) return;
+                    param.currentValue = value;
+                    optimizeRecursive(paramIndex + 1);
+                }
+                return;
             }
-            return;
         } else if (!param.hasMaxLimit) {
             // Max is unlimited but min is not, try a few values starting from min
-            double minVal = param.currentMin;
+            double minVal = Math.max(0, param.currentMin);
             double value = minVal;
-            for (int i = 0; i < 5 && !cancelled; i++) {  // Try 5 values in increasing order
-                param.currentValue = value;
-                optimizeRecursive(paramIndex + 1);
-                value *= 2;  // Double the value each time
+            
+            // Special handling for zero-based parameters
+            if (minVal == 0 && param.step > 0) {
+                value = param.step; // Start with the first step size
+                for (int i = 0; i < 5 && !cancelled; i++) {
+                    param.currentValue = value;
+                    optimizeRecursive(paramIndex + 1);
+                    value *= 2;  // Double the value each time
+                }
+            } else {
+                for (int i = 0; i < 5 && !cancelled; i++) { 
+                    param.currentValue = value;
+                    optimizeRecursive(paramIndex + 1);
+                    value *= 2;
+                }
             }
             return;
         } else if (Math.abs(param.currentMax - param.currentMin) < 1e-6) {
@@ -262,9 +334,21 @@ public class Optimizer {
         }
 
         // Standard case: step from min to max
-        for (double value = param.currentMin; value <= param.currentMax && !cancelled; value += param.step) {
-            param.currentValue = value;
-            optimizeRecursive(paramIndex + 1);
+        if ("finCount".equals(param.name)) {
+            // For finCount, use integer values only
+            int minVal = (int)Math.max(1, Math.ceil(param.currentMin));
+            int maxVal = (int)Math.min(8, Math.floor(param.currentMax));
+            for (int value = minVal; value <= maxVal && !cancelled; value++) {
+                param.currentValue = value;
+                optimizeRecursive(paramIndex + 1);
+            }
+        } else {
+            // For other parameters, use regular stepping
+            double min = Math.max(0, param.currentMin); // Ensure non-negative values
+            for (double value = min; value <= param.currentMax && !cancelled; value += param.step) {
+                param.currentValue = value;
+                optimizeRecursive(paramIndex + 1);
+            }
         }
     }
 
@@ -285,7 +369,17 @@ public class Optimizer {
         if (statusListener != null) {
             StringBuilder status = new StringBuilder();
             for (FinParameter param : parameters) {
-                status.append(String.format("%s=%.2f ", param.name, param.currentValue));
+                // Use internal param.name for key lookup
+                if (config.enabledParams.getOrDefault(param.name, true)) {
+                    status.append(String.format("%s=%.2f ", param.name, param.currentValue));
+                }
+            }
+            // Add parachute status if needed
+            if (config.enabledParams.getOrDefault("Stage 1 Parachute", true) && stage1Parachute != null) {
+                 status.append(String.format("Stage1Parachute=%s ", currentStage1Parachute));
+            }
+             if (config.enabledParams.getOrDefault("Stage 2 Parachute", true) && stage2Parachute != null) {
+                 status.append(String.format("Stage2Parachute=%s ", currentStage2Parachute));
             }
             statusListener.updateStatus(status.toString());
         }
@@ -293,11 +387,11 @@ public class Optimizer {
         try {
             // Apply numeric parameter values only if enabled
             for (FinParameter param : parameters) {
-                String displayName = getDisplayName(param.name);
-                boolean isEnabled = config.enabledParams.getOrDefault(displayName, true);
+                // Use internal param.name as key
+                boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
                 
                 if (!isEnabled) {
-                    // If parameter is disabled, use the original value
+                    // If parameter is disabled, ensure it's set to the original value
                     switch (param.name) {
                         case "thickness":
                             fins.setThickness(originalValues.get("thickness"));
@@ -385,7 +479,7 @@ public class Optimizer {
             double duration = result.duration;
 
             double altitudeScore = config.enabledParams.getOrDefault("Altitude Score", true) ?
-                    Math.abs(apogee - config.targetApogee) : 0;
+                    calculateAltitudeScore(apogee, config.altitudeRange[0], config.altitudeRange[1]) : 0;
             double durationScore = config.enabledParams.getOrDefault("Duration Score", true) ?
                     calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]) : 0;
             double totalError = altitudeScore + durationScore;
@@ -424,10 +518,44 @@ public class Optimizer {
         }
     }
 
+    private double calculateAltitudeScore(double actualAltitude, double min, double max) {
+        // If min is "unlimited" (negative infinity), only check upper bound
+        if (min == Double.NEGATIVE_INFINITY) {
+            return (actualAltitude <= max) ? 0 : (actualAltitude - max);
+        }
+        // If max is "unlimited" (MAX_VALUE), only check lower bound
+        else if (max == Double.MAX_VALUE) {
+            return (actualAltitude >= min) ? 0 : (min - actualAltitude);
+        }
+        // Both bounds are specified
+        else if (actualAltitude >= min && actualAltitude <= max) {
+            return 0;
+        }
+        // Outside of bounds
+        else {
+            double boundary = (actualAltitude < min) ? min : max;
+            return Math.abs(actualAltitude - boundary);
+        }
+    }
+
     private double calculateDurationScore(double actualDuration, double min, double max) {
-        if (actualDuration >= min && actualDuration <= max) return 0;
-        double boundary = (actualDuration < min) ? min : max;
-        return Math.abs(actualDuration - boundary) * 4;
+        // If min is "unlimited" (negative infinity), only check upper bound
+        if (min == Double.NEGATIVE_INFINITY) {
+            return (actualDuration <= max) ? 0 : (actualDuration - max) * 4;
+        }
+        // If max is "unlimited" (MAX_VALUE), only check lower bound
+        else if (max == Double.MAX_VALUE) {
+            return (actualDuration >= min) ? 0 : (min - actualDuration) * 4;
+        }
+        // Both bounds are specified
+        else if (actualDuration >= min && actualDuration <= max) {
+            return 0;
+        }
+        // Outside of bounds
+        else {
+            double boundary = (actualDuration < min) ? min : max;
+            return Math.abs(actualDuration - boundary) * 4;
+        }
     }
 
     public void optimizeFins() {
@@ -436,7 +564,7 @@ public class Optimizer {
         currentMajorStep = 0; // Reset progress
         
         for (FinParameter param : parameters) {
-            if (config.enabledParams.getOrDefault(getDisplayName(param.name), true)) {
+            if (config.enabledParams.getOrDefault(param.name, true)) {
                 if (param.absoluteMin > param.absoluteMax) {
                     throw new IllegalStateException("Invalid bounds for parameter: " + getDisplayName(param.name));
                 }
@@ -451,7 +579,7 @@ public class Optimizer {
         boolean anyParachutesEnabled = parachute1Enabled || parachute2Enabled;
         boolean anyNumericParamsEnabled = false;
         for (FinParameter param : parameters) {
-            if (config.enabledParams.getOrDefault(getDisplayName(param.name), true)) {
+            if (config.enabledParams.getOrDefault(param.name, true)) {
                 anyNumericParamsEnabled = true;
                 break;
             }
@@ -614,7 +742,7 @@ public class Optimizer {
                     double duration = result.duration;
                     
                     double altitudeScore = config.enabledParams.getOrDefault("Altitude Score", true) ?
-                            Math.abs(apogee - config.targetApogee) : 0;
+                            calculateAltitudeScore(apogee, config.altitudeRange[0], config.altitudeRange[1]) : 0;
                     double durationScore = config.enabledParams.getOrDefault("Duration Score", true) ?
                             calculateDurationScore(duration, config.durationRange[0], config.durationRange[1]) : 0;
                     double totalError = altitudeScore + durationScore;
@@ -790,11 +918,11 @@ public class Optimizer {
 
     private void adjustParametersForNextPhase() {
         for (FinParameter param : parameters) {
-            String displayName = getDisplayName(param.name);
-            boolean isEnabled = config.enabledParams.getOrDefault(displayName, true);
+            // Use internal param.name as key
+            boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
             
             if (!isEnabled) {
-                // Reset disabled parameters to original search space
+                // If disabled, keep its value fixed at original, min/max set to original, step 0
                 param.currentValue = originalValues.get(param.name);
                 param.currentMin = originalValues.get(param.name);
                 param.currentMax = originalValues.get(param.name);
@@ -811,22 +939,26 @@ public class Optimizer {
                 param.step = Math.max(param.step * 0.5, 0.01);
             }
             
+            // Enforce absolute minimum first
             param.currentMin = Math.max(param.absoluteMin, bestVal - param.step * 3);
             
+            // Then enforce absolute maximum
             if (param.hasMaxLimit) {
                 param.currentMax = Math.min(param.absoluteMax, bestVal + param.step * 3);
             } else {
-                // For unlimited parameters, explore a range around the best value
-                param.currentMax = bestVal * 2;
+                param.currentMax = bestVal + param.step * 3;
             }
+
+            // Final safeguard against invalid ranges
+            param.currentMin = Math.min(param.currentMin, param.currentMax);
         }
     }
 
     private int calculateTotalEvaluations() {
         int total = 1;
         for (FinParameter param : parameters) {
-            String displayName = getDisplayName(param.name);
-            boolean isEnabled = config.enabledParams.getOrDefault(displayName, true);
+            // Use internal param.name as key
+            boolean isEnabled = config.enabledParams.getOrDefault(param.name, true);
             
             if (!isEnabled) {
                 continue; // Skip disabled parameters
@@ -1000,42 +1132,79 @@ public class Optimizer {
         String key = getParamKey(paramName);
         for (FinParameter param : parameters) {
             if (param.name.equals(key)) {
-                param.absoluteMin = min;
-                param.absoluteMax = max;
-                param.currentMin = min;
-                param.currentMax = max;
-                param.hasMaxLimit = (max != Double.MAX_VALUE);
-                
-                // Handle min==max case by setting a non-zero step
-                if (min == Double.NEGATIVE_INFINITY && max == Double.MAX_VALUE) {
-                    // Both min and max are unlimited, use a reasonable default step
-                    param.step = 1.0;
-                } else if (min == Double.NEGATIVE_INFINITY) {
-                    // Unlimited min, use step based on max value
-                    param.step = Math.max(Math.abs(max) * 0.1, 0.01);
-                } else if (max == Double.MAX_VALUE) {
-                    // Unlimited max, use step based on min value
-                    param.step = Math.max(Math.abs(min) * 0.1, 0.01);
-                } else if (Math.abs(max - min) < 1e-6) {
-                    param.step = 1.0;
+                // Determine the effective bounds by clamping user input against absolute limits
+                double effectiveMin, effectiveMax;
+
+                // Clamp minimum: Take the less restrictive of 0 or absoluteMin, then the more restrictive of that and user min.
+                double paramAbsoluteMin = "finCount".equals(param.name) ? 1.0 : 0.0; // Parameter-specific absolute minimums
+                effectiveMin = Math.max(paramAbsoluteMin, param.absoluteMin); // Start with physical/practical min
+                effectiveMin = Math.max(effectiveMin, min); // Apply user's min if it's more restrictive
+
+                // Clamp maximum: Take the more restrictive of user max and absoluteMax
+                effectiveMax = max == Double.MAX_VALUE ? param.absoluteMax : Math.min(param.absoluteMax, max); // Apply user's max or absolute max
+
+                // Ensure effectiveMin is not greater than effectiveMax after clamping
+                if (effectiveMin > effectiveMax) {
+                     // This case might happen if user min > absolute max. Reset min to absolute max.
+                     effectiveMin = effectiveMax; 
+                }
+
+                param.currentMin = effectiveMin;
+                param.currentMax = effectiveMax;
+                param.hasMaxLimit = (effectiveMax != Double.MAX_VALUE && effectiveMax < Double.POSITIVE_INFINITY); // Check if there's a finite upper bound
+
+                // Adjust step based on the *effective* range
+                if (effectiveMin == Double.NEGATIVE_INFINITY && effectiveMax == Double.POSITIVE_INFINITY) {
+                    param.step = 1.0; // Both unlimited
+                } else if (effectiveMin == Double.NEGATIVE_INFINITY) {
+                    param.step = Math.max(Math.abs(effectiveMax) * 0.1, 0.01); // Min unlimited
+                } else if (!param.hasMaxLimit || effectiveMax == Double.POSITIVE_INFINITY) {
+                    param.step = Math.max(Math.abs(effectiveMin) * 0.1, 0.01); // Max unlimited
+                } else if (Math.abs(effectiveMax - effectiveMin) < 1e-6) {
+                    param.step = 0; // No range to step over
                 } else {
-                    param.step = Math.max((max - min) / 10, 0.01);
+                    param.step = Math.max((effectiveMax - effectiveMin) / 10.0, 0.01); // Finite range
                 }
                 
+                // Special step handling for finCount
+                if ("finCount".equals(param.name)) {
+                    param.step = Math.max(1.0, param.step); // Fin count step must be at least 1
+                    param.currentMin = Math.ceil(param.currentMin); // Ensure integer min
+                    param.currentMax = Math.floor(param.currentMax); // Ensure integer max
+                    // Recalculate effectiveMin/Max after ceiling/flooring for finCount
+                    effectiveMin = param.currentMin; 
+                    effectiveMax = param.currentMax;
+                    if (effectiveMin > effectiveMax) { // Handle case where floor/ceil makes range invalid
+                        effectiveMin = effectiveMax;
+                        param.currentMin = effectiveMin;
+                    }
+                }
+                
+                log(String.format("Updated bounds for %s: Effective Min=%.2f, Effective Max=%.2f, Step=%.2f", 
+                                  paramName, effectiveMin, effectiveMax == Double.MAX_VALUE ? Double.POSITIVE_INFINITY : effectiveMax, param.step));
+
                 break;
             }
         }
     }
 
     private String getParamKey(String displayName) {
+        // Map GUI display names (which might include units) to internal parameter keys
+        if (displayName.startsWith("Fin Thickness")) return "thickness";
+        if (displayName.startsWith("Root Chord")) return "rootChord";
+        if (displayName.startsWith("Fin Height")) return "height";
+        if (displayName.startsWith("Number of Fins")) return "finCount";
+        if (displayName.startsWith("Nose Cone Length")) return "noseLength";
+        if (displayName.startsWith("Nose Cone Wall Thickness")) return "noseWallThickness";
+        // Add fallbacks for other potential names or direct keys
         switch (displayName) {
-            case "Fin Thickness": return "thickness";
-            case "Root Chord": return "rootChord";
-            case "Fin Height": return "height";
-            case "Number of Fins": return "finCount";
-            case "Nose Cone Length": return "noseLength";
-            case "Nose Cone Wall Thickness": return "noseWallThickness";
-            default: return displayName.toLowerCase().replace(" ", "");
+            case "Fin Thickness (cm)": return "thickness";
+            case "Root Chord (cm)": return "rootChord";
+            case "Fin Height (cm)": return "height";
+            // Number of Fins is already handled
+            case "Nose Cone Length (cm)": return "noseLength";
+            case "Nose Cone Wall Thickness (cm)": return "noseWallThickness";
+            default: return displayName.toLowerCase().replace(" ", ""); // Default conversion
         }
     }
     
@@ -1128,7 +1297,7 @@ public class Optimizer {
             SimulationStepper.SimulationResult result = new SimulationStepper(rocket, baseOptions).runSimulation();
             values.put("apogee", result.altitude);
             values.put("duration", result.duration);
-            values.put("altitudeScore", Math.abs(result.altitude - config.targetApogee));
+            values.put("altitudeScore", calculateAltitudeScore(result.altitude, config.altitudeRange[0], config.altitudeRange[1]));
             values.put("durationScore", calculateDurationScore(result.duration, config.durationRange[0], config.durationRange[1]));
             values.put("totalScore", values.get("altitudeScore") + values.get("durationScore"));
         } catch (Exception e) {
@@ -1186,5 +1355,19 @@ public class Optimizer {
      */
     public boolean hasStage2Parachute() {
         return stage2Parachute != null;
+    }
+
+    /**
+     * Retrieves the FinParameter object based on its display name.
+     * 
+     * @param displayName The display name used in the GUI (e.g., "Fin Thickness (cm)").
+     * @return The corresponding FinParameter, or null if not found.
+     */
+    public FinParameter getFinParameter(String displayName) {
+        String key = getParamKey(displayName);
+        return parameters.stream()
+                .filter(p -> p.name.equals(key))
+                .findFirst()
+                .orElse(null);
     }
 }
